@@ -312,6 +312,7 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
     <div class="tab active" data-section="data-section">Data Browser</div>
     <div class="tab" data-section="stats-section">Statistics</div>
     <div class="tab" data-section="chart-section">Charts</div>
+    <div class="tab" data-section="pbps-section">Normalized PBPS</div>
     <div class="tab" data-section="sql-section">SQL Console</div>
 </div>
 
@@ -385,6 +386,16 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
         <button onclick="renderChart()">Draw Chart</button>
     </div>
     <div id="chart"></div>
+</div>
+</div>
+
+<!-- NORMALIZED PBPS -->
+<div class="section" id="pbps-section">
+<div class="panel">
+    <p class="info">Per-pixel Bytes Per Second normalized against resolution class average. Shows files with duration &gt; 10 minutes, ordered by ratio vs average (highest first).</p>
+    <button onclick="loadPBPS()">Run Analysis</button>
+    <span id="pbpsInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    <div class="table-wrap" id="pbpsTableWrap" style="margin-top:12px"></div>
 </div>
 </div>
 
@@ -645,6 +656,47 @@ async function runSQL() {
 document.getElementById('sqlInput').addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runSQL();
 });
+
+// Normalized PBPS
+async function loadPBPS() {
+    const sql = `WITH bpp AS (
+    SELECT *,
+           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+),
+avg_bpp AS (
+    SELECT resolution_class,
+           AVG(bpp_sec) AS avg_bpp_sec
+    FROM bpp
+    GROUP BY resolution_class
+)
+SELECT b.file_name,
+       b.file_path,
+       b.video_codec,
+       b.resolution_class,
+       ROUND(b.bpp_sec, 6) AS bpp_sec,
+       ROUND(a.avg_bpp_sec, 6) AS avg_for_res,
+       ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio_vs_avg,
+       ROUND(b.file_size_bytes / 1048576.0, 1) AS size_mb,
+       ROUND(b.duration_seconds / 60.0, 1) AS dur_min
+FROM bpp b
+JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+WHERE dur_min > 10
+ORDER BY ratio_vs_avg DESC`;
+    const resp = await fetch(`/api/query?sql=${encodeURIComponent(sql)}`);
+    const data = await resp.json();
+    if (data.error) {
+        document.getElementById('pbpsInfo').textContent = 'Error: ' + data.error;
+        document.getElementById('pbpsTableWrap').innerHTML = '';
+        return;
+    }
+    document.getElementById('pbpsInfo').textContent = `${data.total} rows returned`;
+    let html = '<table><thead><tr>' + data.columns.map(c => `<th>${escHtml(c)}</th>`).join('') + '</tr></thead><tbody>';
+    html += data.rows.map(row => '<tr>' + data.columns.map(c => `<td>${escHtml(fmt(row[c]))}</td>`).join('') + '</tr>').join('');
+    html += '</tbody></table>';
+    document.getElementById('pbpsTableWrap').innerHTML = html;
+}
 
 init();
 </script>
