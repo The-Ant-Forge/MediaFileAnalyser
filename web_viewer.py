@@ -11,10 +11,301 @@ import json
 import math
 import os
 import sqlite3
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 DB_PATH = "media.db"
+CONFIG_PATH = "media_analyser_config.json"
+
+DEFAULT_CONFIG = {
+    "scan_folders": [],
+    "ignore_patterns": [],
+    "ffprobe_path": "",
+    "workers": 8,
+}
+
+
+def load_config():
+    """Load config from JSON file, merging with defaults."""
+    config = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                saved = json.load(f)
+            config.update(saved)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return config
+
+
+def save_config(config):
+    """Save config to JSON file."""
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Scan state (shared between scan thread and API handler)
+# ---------------------------------------------------------------------------
+scan_state = {
+    "running": False,
+    "phase": "idle",
+    "total": 0,
+    "done": 0,
+    "errors": 0,
+    "message": "",
+}
+scan_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Scan logic (reuses index_media internals)
+# ---------------------------------------------------------------------------
+from index_media import (
+    VIDEO_EXTENSIONS, init_db, probe_file,
+    insert_file, insert_streams,
+)
+
+
+def find_video_files_filtered(paths, ignore_patterns):
+    """Walk directories finding video files, skipping ignored folder names."""
+    files = []
+    lower_patterns = [p.lower() for p in ignore_patterns if p]
+    for base in paths:
+        if not os.path.exists(base):
+            continue
+        if os.path.isfile(base):
+            if Path(base).suffix.lower() in VIDEO_EXTENSIONS:
+                files.append(base)
+            continue
+        for root, dirs, filenames in os.walk(base):
+            # Prune ignored directories in-place
+            if lower_patterns:
+                dirs[:] = [d for d in dirs
+                           if not any(pat in d.lower() for pat in lower_patterns)]
+            for fname in sorted(filenames):
+                if Path(fname).suffix.lower() in VIDEO_EXTENSIONS:
+                    files.append(os.path.join(root, fname))
+    return files
+
+
+def _load_existing_index():
+    """Load file_path → (file_mtime, file_size_bytes) from the live DB."""
+    index = {}
+    if not os.path.exists(DB_PATH):
+        return index
+    try:
+        conn = get_db()
+        for row in conn.execute("SELECT file_path, file_mtime, file_size_bytes FROM files"):
+            index[row["file_path"]] = (row["file_mtime"], row["file_size_bytes"])
+        conn.close()
+    except Exception:
+        pass
+    return index
+
+
+def _copy_file_rows(src_conn, dst_conn, filepath):
+    """Copy a file and its streams from src DB to dst DB."""
+    src_row = src_conn.execute("SELECT * FROM files WHERE file_path = ?", (filepath,)).fetchone()
+    if not src_row:
+        return False
+    src_dict = dict(src_row)
+    old_id = src_dict.pop("id")
+    cols = list(src_dict.keys())
+    placeholders = ", ".join(["?"] * len(cols))
+    col_names = ", ".join(f"[{c}]" for c in cols)
+    cur = dst_conn.execute(
+        f"INSERT INTO files ({col_names}) VALUES ({placeholders})",
+        [src_dict[c] for c in cols],
+    )
+    new_id = cur.lastrowid
+
+    # Copy streams
+    for srow in src_conn.execute("SELECT * FROM streams WHERE file_id = ?", (old_id,)):
+        sd = dict(srow)
+        sd.pop("id")
+        sd["file_id"] = new_id
+        scols = list(sd.keys())
+        dst_conn.execute(
+            f"INSERT OR IGNORE INTO streams ({', '.join(f'[{c}]' for c in scols)}) VALUES ({', '.join(['?'] * len(scols))})",
+            [sd[c] for c in scols],
+        )
+    return True
+
+
+def run_scan():
+    """Background scan: discover, probe new/changed files, copy unchanged, then swap."""
+    try:
+        config = load_config()
+        folders = config.get("scan_folders", [])
+        if not folders:
+            with scan_lock:
+                scan_state.update(running=False, phase="error",
+                                  message="No scan folders configured")
+            return
+
+        ignore = config.get("ignore_patterns", [])
+        ffprobe_cmd = config.get("ffprobe_path", "").strip() or "ffprobe"
+        workers = config.get("workers", 8)
+
+        # Phase: discovering files
+        with scan_lock:
+            scan_state["phase"] = "discovering"
+            scan_state["message"] = "Scanning directories..."
+        video_files = find_video_files_filtered(folders, ignore)
+
+        if not video_files:
+            with scan_lock:
+                scan_state.update(running=False, phase="error",
+                                  message="No video files found in configured folders")
+            return
+
+        # Phase: checking which files need probing
+        with scan_lock:
+            scan_state["phase"] = "checking"
+            scan_state["message"] = "Checking file timestamps..."
+
+        existing_index = _load_existing_index()
+        to_probe = []
+        to_copy = []
+        for fp in video_files:
+            try:
+                st = os.stat(fp)
+                mtime = st.st_mtime
+                size = st.st_size
+            except OSError:
+                to_probe.append(fp)
+                continue
+
+            prev = existing_index.get(fp)
+            if prev and prev[0] is not None and prev[0] == mtime and prev[1] == size:
+                to_copy.append(fp)
+            else:
+                to_probe.append(fp)
+
+        with scan_lock:
+            scan_state["total"] = len(video_files)
+            scan_state["phase"] = "probing"
+            scan_state["message"] = (f"{len(to_copy)} unchanged, {len(to_probe)} to probe...")
+
+        # Create temp database
+        db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+        temp_db = os.path.join(db_dir, "media_scan_temp.db")
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
+        conn = init_db(temp_db)
+
+        done = 0
+        errors = 0
+        skipped = len(to_copy)
+
+        # Copy unchanged files from existing DB
+        if to_copy and os.path.exists(DB_PATH):
+            src_conn = get_db()
+            batch_count = 0
+            for fp in to_copy:
+                if not _copy_file_rows(src_conn, conn, fp):
+                    to_probe.append(fp)  # fallback: re-probe if copy fails
+                batch_count += 1
+                if batch_count >= 100:
+                    conn.commit()
+                    batch_count = 0
+                done += 1
+                with scan_lock:
+                    scan_state["done"] = done
+                    scan_state["message"] = f"Copied {done}/{len(to_copy)} unchanged, {len(to_probe)} to probe"
+            conn.commit()
+            src_conn.close()
+
+        # Probe new/changed files in parallel
+        if to_probe:
+            with scan_lock:
+                scan_state["message"] = f"Probing {len(to_probe)} new/changed files..."
+
+            def probe_and_insert(filepath):
+                return filepath, probe_file(filepath, ffprobe_cmd=ffprobe_cmd)
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(probe_and_insert, f): f for f in to_probe}
+                batch_count = 0
+                for future in as_completed(futures):
+                    filepath, probe_data = future.result()
+                    if probe_data is None:
+                        errors += 1
+                    else:
+                        try:
+                            mtime = os.stat(filepath).st_mtime
+                        except OSError:
+                            mtime = None
+                        file_id = insert_file(conn, filepath, probe_data, file_mtime=mtime)
+                        if file_id:
+                            insert_streams(conn, file_id, probe_data)
+                        batch_count += 1
+                        if batch_count >= 100:
+                            conn.commit()
+                            batch_count = 0
+
+                    done += 1
+                    with scan_lock:
+                        scan_state["done"] = done
+                        scan_state["errors"] = errors
+                        scan_state["message"] = f"{done}/{len(video_files)} files ({skipped} cached, {errors} errors)"
+
+                conn.commit()
+
+        # Phase: swapping databases
+        with scan_lock:
+            scan_state["phase"] = "swapping"
+            scan_state["message"] = "Finalizing database..."
+
+        # Checkpoint and close temp DB
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+
+        # Swap: rename temp → live
+        backup_db = os.path.join(db_dir, "media_old.db")
+        live_db = os.path.abspath(DB_PATH)
+
+        # Remove old backup if present
+        for f in [backup_db, backup_db + "-wal", backup_db + "-shm"]:
+            if os.path.exists(f):
+                os.remove(f)
+
+        # Move current live → backup
+        if os.path.exists(live_db):
+            os.rename(live_db, backup_db)
+            for suffix in ["-wal", "-shm"]:
+                src = live_db + suffix
+                if os.path.exists(src):
+                    os.rename(src, backup_db + suffix)
+
+        # Move temp → live
+        os.rename(temp_db, live_db)
+        for suffix in ["-wal", "-shm"]:
+            src = temp_db + suffix
+            if os.path.exists(src):
+                os.rename(src, live_db + suffix)
+
+        # Clean up backup
+        for f in [backup_db, backup_db + "-wal", backup_db + "-shm"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+        invalidate_pbps_tiles_cache()
+        with scan_lock:
+            scan_state.update(running=False, phase="done",
+                              message=f"Scan complete: {done} files ({skipped} cached, {len(to_probe)} probed, {errors} errors)")
+
+    except Exception as e:
+        with scan_lock:
+            scan_state.update(running=False, phase="error",
+                              message=f"Scan failed: {e}")
 
 
 def get_db():
@@ -26,6 +317,80 @@ def get_db():
 
 def dict_rows(cursor):
     return [dict(row) for row in cursor.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# PBPS tiles cache — only recomputed after a scan or on first request
+# ---------------------------------------------------------------------------
+_pbps_tiles_cache = {"data": None}
+
+PBPS_TILES_SQL = """
+WITH bpp AS (
+    SELECT *,
+           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+),
+avg_bpp AS (
+    SELECT resolution_class,
+           AVG(bpp_sec) AS avg_bpp_sec
+    FROM bpp
+    GROUP BY resolution_class
+),
+joined AS (
+    SELECT b.bpp_sec,
+           b.bpp_sec / a.avg_bpp_sec AS ratio_vs_avg,
+           b.video_codec,
+           b.resolution_class,
+           b.duration_seconds
+    FROM bpp b
+    JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+    WHERE b.duration_seconds / 60.0 > 10
+)
+SELECT
+    SUM(CASE WHEN ratio_vs_avg > 2 THEN 1 ELSE 0 END) AS rva_up_count,
+    SUM(CASE WHEN ratio_vs_avg < 0.5 THEN 1 ELSE 0 END) AS rva_down_count,
+    ROUND(AVG(bpp_sec), 6) AS mean_bpp_sec,
+    SUM(CASE WHEN video_codec = 'h264' THEN 1 ELSE 0 END) AS h264_count,
+    SUM(CASE WHEN resolution_class IN ('720p', '480p', 'other') THEN 1 ELSE 0 END) AS low_res_count,
+    COUNT(*) AS total_files
+FROM joined
+"""
+
+PBPS_MEDIAN_SQL = """
+WITH bpp AS (
+    SELECT file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec,
+           duration_seconds
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+)
+SELECT ROUND(bpp_sec, 6) AS median_bpp_sec
+FROM bpp
+WHERE duration_seconds / 60.0 > 10
+ORDER BY bpp_sec
+LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM bpp WHERE duration_seconds / 60.0 > 10)
+"""
+
+
+def compute_pbps_tiles():
+    conn = get_db()
+    try:
+        row = dict(conn.execute(PBPS_TILES_SQL).fetchone())
+        median_row = conn.execute(PBPS_MEDIAN_SQL).fetchone()
+        row["median_bpp_sec"] = median_row["median_bpp_sec"] if median_row else None
+        return row
+    finally:
+        conn.close()
+
+
+def get_pbps_tiles():
+    if _pbps_tiles_cache["data"] is None:
+        _pbps_tiles_cache["data"] = compute_pbps_tiles()
+    return _pbps_tiles_cache["data"]
+
+
+def invalidate_pbps_tiles_cache():
+    _pbps_tiles_cache["data"] = None
 
 
 class APIHandler(BaseHTTPRequestHandler):
@@ -63,9 +428,74 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_stats(params)
         elif path == "/api/query":
             self.handle_query(params)
+        elif path == "/api/config":
+            self.handle_get_config()
+        elif path == "/api/scan/status":
+            self.handle_scan_status()
+        elif path == "/api/pbps/tiles":
+            self.handle_pbps_tiles()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/api/config":
+            self.handle_post_config()
+        elif path == "/api/scan/start":
+            self.handle_scan_start()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def handle_get_config(self):
+        self.send_json(load_config())
+
+    def handle_post_config(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": "Invalid JSON"}, 400)
+            return
+        config = load_config()
+        if "scan_folders" in body and isinstance(body["scan_folders"], list):
+            config["scan_folders"] = [str(p) for p in body["scan_folders"]]
+        if "ignore_patterns" in body and isinstance(body["ignore_patterns"], list):
+            config["ignore_patterns"] = [str(p) for p in body["ignore_patterns"]]
+        if "ffprobe_path" in body:
+            config["ffprobe_path"] = str(body["ffprobe_path"])
+        if "workers" in body:
+            config["workers"] = max(1, min(32, int(body["workers"])))
+        save_config(config)
+        self.send_json({"ok": True})
+
+    def handle_scan_status(self):
+        with scan_lock:
+            self.send_json(dict(scan_state))
+
+    def handle_pbps_tiles(self):
+        try:
+            self.send_json(get_pbps_tiles())
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_scan_start(self):
+        with scan_lock:
+            if scan_state["running"]:
+                self.send_json({"error": "Scan already running"}, 409)
+                return
+            scan_state["running"] = True
+            scan_state["phase"] = "starting"
+            scan_state["total"] = 0
+            scan_state["done"] = 0
+            scan_state["errors"] = 0
+            scan_state["message"] = ""
+        t = threading.Thread(target=run_scan, daemon=True)
+        t.start()
+        self.send_json({"started": True})
 
     def handle_views(self):
         """List available views/tables."""
@@ -302,11 +732,71 @@ tr:hover td { background: rgba(233,69,96,0.08); }
 /* SQL */
 textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; resize: vertical; }
 .info { color: var(--text2); font-size: 0.8em; margin-bottom: 8px; }
+
+/* Header row */
+.header-row { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.header-row h1 { margin-bottom: 0; }
+.header-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.icon-btn { background: var(--surface); border: 1px solid var(--border); color: var(--text2);
+            width: 36px; height: 36px; border-radius: 6px; cursor: pointer; font-size: 1.2em;
+            display: flex; align-items: center; justify-content: center; padding: 0; }
+.icon-btn:hover { background: var(--border); color: var(--text); }
+.icon-btn.scanning { animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* Settings overlay */
+.settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100;
+                    display: none; align-items: center; justify-content: center; }
+.settings-overlay.open { display: flex; }
+.settings-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+                  padding: 24px; width: 560px; max-width: 95vw; max-height: 85vh; overflow-y: auto; }
+.settings-panel h2 { margin-top: 0; }
+.settings-panel h3 { color: var(--green); font-size: 0.95em; margin: 16px 0 6px; }
+.settings-panel .list-items { margin: 4px 0 8px; }
+.settings-panel .list-item { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 0.85em; }
+.settings-panel .list-item span { flex: 1; word-break: break-all; color: var(--text); }
+.settings-panel .remove-btn { background: none; border: none; color: var(--accent); cursor: pointer;
+                               font-size: 1em; padding: 2px 6px; }
+.settings-panel .remove-btn:hover { color: #ff6b81; }
+.settings-panel .add-row { display: flex; gap: 6px; }
+.settings-panel .add-row input { flex: 1; }
+.settings-panel .actions { display: flex; gap: 8px; margin-top: 20px; justify-content: flex-end; }
+.settings-panel .actions button { padding: 8px 20px; }
+
+/* Score tiles */
+.score-tiles { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+.score-tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+              padding: 12px 18px; min-width: 130px; flex: 1; text-align: center; }
+.score-tile .tile-value { font-size: 1.6em; font-weight: 700; color: var(--green); line-height: 1.2; }
+.score-tile .tile-label { font-size: 0.75em; color: var(--text2); margin-top: 2px; }
+.score-tile.warn .tile-value { color: var(--accent); }
+.score-tile.neutral .tile-value { color: var(--text); }
+.tile-pct { font-size: 0.5em; color: var(--text2); font-weight: 400; }
+
+/* Scan toast */
+.scan-toast { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface);
+              border-top: 2px solid var(--border); padding: 10px 20px; z-index: 90;
+              display: none; align-items: center; gap: 12px; font-size: 0.85em; }
+.scan-toast.visible { display: flex; }
+.scan-toast .progress-wrap { flex: 1; background: var(--bg); border-radius: 4px; height: 18px; overflow: hidden; }
+.scan-toast .progress-bar { height: 100%; background: var(--green); border-radius: 4px;
+                            transition: width 0.3s ease; min-width: 0; }
+.scan-toast .progress-bar.error { background: var(--accent); }
+.scan-toast .scan-info { white-space: nowrap; color: var(--text2); }
+.scan-toast .dismiss-btn { background: none; border: none; color: var(--text2); cursor: pointer;
+                           font-size: 1.1em; padding: 2px 6px; }
+.scan-toast .dismiss-btn:hover { color: var(--text); }
 </style>
 </head>
 <body>
 <div class="container">
-<h1>Media Stats Viewer</h1>
+<div class="header-row">
+    <h1>Media Stats Viewer</h1>
+    <div class="header-actions">
+        <button class="icon-btn" id="scanBtn" onclick="startScan()" title="Start scan">&#9654;</button>
+        <button class="icon-btn" id="settingsBtn" onclick="openSettings()" title="Settings">&#9881;</button>
+    </div>
+</div>
 
 <div class="tabs" id="mainTabs">
     <div class="tab active" data-section="data-section">Data Browser</div>
@@ -391,6 +881,14 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
 
 <!-- NORMALIZED PBPS -->
 <div class="section" id="pbps-section">
+<div class="score-tiles" id="pbpsTiles">
+    <div class="score-tile warn" id="tileRVAUp"><div class="tile-value">--</div><div class="tile-label">R&#9650;A (&gt;2x avg)</div></div>
+    <div class="score-tile warn" id="tileRVADown"><div class="tile-value">--</div><div class="tile-label">R&#9660;A (&lt;0.5x avg)</div></div>
+    <div class="score-tile neutral" id="tileMedianBPP"><div class="tile-value">--</div><div class="tile-label">Median BPP/sec</div></div>
+    <div class="score-tile neutral" id="tileMeanBPP"><div class="tile-value">--</div><div class="tile-label">Mean BPP/sec</div></div>
+    <div class="score-tile" id="tileH264"><div class="tile-value">--</div><div class="tile-label">h264 Files</div></div>
+    <div class="score-tile" id="tile720p"><div class="tile-value">--</div><div class="tile-label">&le;720p Files</div></div>
+</div>
 <div class="panel">
     <p class="info">Per-pixel Bytes Per Second normalized against resolution class average. Shows files with duration &gt; 10 minutes, ordered by ratio vs average (highest first).</p>
     <button onclick="loadPBPS()">Run Analysis</button>
@@ -414,6 +912,49 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
 
 </div>
 
+<!-- SETTINGS MODAL -->
+<div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
+<div class="settings-panel">
+    <h2 style="color:var(--green);margin-top:0">Settings</h2>
+
+    <h3>Target Folders</h3>
+    <div class="list-items" id="folderList"></div>
+    <div class="add-row">
+        <input type="text" id="newFolder" placeholder="/path/to/media/folder">
+        <button onclick="addListItem('folder')">Add</button>
+    </div>
+
+    <h3>Ignore Patterns</h3>
+    <p style="color:var(--text2);font-size:0.78em;margin-bottom:4px">Directory names containing these strings will be skipped during scanning</p>
+    <div class="list-items" id="patternList"></div>
+    <div class="add-row">
+        <input type="text" id="newPattern" placeholder="e.g. sample, mature, .recycle">
+        <button onclick="addListItem('pattern')">Add</button>
+    </div>
+
+    <h3>ffprobe Path</h3>
+    <input type="text" id="ffprobePath" placeholder="(uses system PATH)" style="width:100%">
+
+    <h3>Parallel Workers</h3>
+    <input type="number" id="workerCount" min="1" max="32" value="8" style="width:80px">
+
+    <div class="actions">
+        <button onclick="closeSettings()" style="background:var(--surface)">Cancel</button>
+        <button onclick="saveSettings()">Save</button>
+    </div>
+</div>
+</div>
+
+<!-- SCAN TOAST -->
+<div class="scan-toast" id="scanToast">
+    <span class="scan-info" id="scanPhase">Idle</span>
+    <div class="progress-wrap">
+        <div class="progress-bar" id="scanProgressBar" style="width:0%"></div>
+    </div>
+    <span class="scan-info" id="scanDetail"></span>
+    <button class="dismiss-btn" onclick="dismissScanToast()" title="Dismiss">&times;</button>
+</div>
+
 <script>
 let currentOffset = 0;
 let currentTotal = 0;
@@ -428,6 +969,7 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById(tab.dataset.section).classList.add('active');
+        if (tab.dataset.section === 'pbps-section') loadPBPSTiles();
     });
 });
 
@@ -488,6 +1030,40 @@ function fmt(v) {
 }
 
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// Reusable client-side sortable table
+function renderSortableTable(wrapId, columns, rows) {
+    const state = renderSortableTable._state = renderSortableTable._state || {};
+    if (!state[wrapId]) state[wrapId] = { col: '', dir: 'asc', columns: [], rows: [] };
+    if (columns) { state[wrapId].columns = columns; state[wrapId].rows = rows; state[wrapId].col = ''; state[wrapId].dir = 'asc'; }
+    const s = state[wrapId];
+    let sorted = [...s.rows];
+    if (s.col) {
+        sorted.sort((a, b) => {
+            let va = a[s.col], vb = b[s.col];
+            if (va == null && vb == null) return 0;
+            if (va == null) return 1;
+            if (vb == null) return -1;
+            if (typeof va === 'number' && typeof vb === 'number') return s.dir === 'asc' ? va - vb : vb - va;
+            va = String(va).toLowerCase(); vb = String(vb).toLowerCase();
+            return s.dir === 'asc' ? va.localeCompare(vb) : vb.localeCompare(va);
+        });
+    }
+    const arrow = c => s.col === c ? (s.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    let html = '<table><thead><tr>' + s.columns.map(c =>
+        `<th onclick="sortTableCol('${wrapId}','${c.replace(/'/g,"\\'")}')">${escHtml(c)}<span class="sort-arrow">${arrow(c)}</span></th>`
+    ).join('') + '</tr></thead><tbody>';
+    html += sorted.map(row => '<tr>' + s.columns.map(c => `<td title="${escHtml(String(row[c] ?? ''))}">${escHtml(fmt(row[c]))}</td>`).join('') + '</tr>').join('');
+    html += '</tbody></table>';
+    document.getElementById(wrapId).innerHTML = html;
+}
+
+function sortTableCol(wrapId, col) {
+    const s = renderSortableTable._state[wrapId];
+    if (s.col === col) s.dir = s.dir === 'asc' ? 'desc' : 'asc';
+    else { s.col = col; s.dir = 'asc'; }
+    renderSortableTable(wrapId);
+}
 
 function sortBy(col) {
     if (currentSort === col) currentDir = currentDir === 'asc' ? 'desc' : 'asc';
@@ -647,19 +1223,37 @@ async function runSQL() {
         return;
     }
     document.getElementById('sqlInfo').textContent = `${data.total} rows returned`;
-    let html = '<table><thead><tr>' + data.columns.map(c => `<th>${escHtml(c)}</th>`).join('') + '</tr></thead><tbody>';
-    html += data.rows.map(row => '<tr>' + data.columns.map(c => `<td>${escHtml(fmt(row[c]))}</td>`).join('') + '</tr>').join('');
-    html += '</tbody></table>';
-    document.getElementById('sqlTableWrap').innerHTML = html;
+    renderSortableTable('sqlTableWrap', data.columns, data.rows);
 }
 
 document.getElementById('sqlInput').addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') runSQL();
 });
 
-// Normalized PBPS
+// Normalized PBPS — tiles
+let pbpsTilesLoaded = false;
+
+async function loadPBPSTiles(force) {
+    if (pbpsTilesLoaded && !force) return;
+    try {
+        const resp = await fetch('/api/pbps/tiles');
+        const t = await resp.json();
+        if (t.error) return;
+        document.querySelector('#tileRVAUp .tile-value').textContent = (t.rva_up_count ?? 0).toLocaleString();
+        document.querySelector('#tileRVADown .tile-value').textContent = (t.rva_down_count ?? 0).toLocaleString();
+        document.querySelector('#tileMedianBPP .tile-value').textContent = t.median_bpp_sec != null ? t.median_bpp_sec : '--';
+        document.querySelector('#tileMeanBPP .tile-value').textContent = t.mean_bpp_sec != null ? t.mean_bpp_sec : '--';
+        const total = t.total_files || 1;
+        const h264 = t.h264_count ?? 0;
+        const lowRes = t.low_res_count ?? 0;
+        document.querySelector('#tileH264 .tile-value').innerHTML = `${h264.toLocaleString()} <span class="tile-pct">(${Math.round(h264/total*100)}%)</span>`;
+        document.querySelector('#tile720p .tile-value').innerHTML = `${lowRes.toLocaleString()} <span class="tile-pct">(${Math.round(lowRes/total*100)}%)</span>`;
+        pbpsTilesLoaded = true;
+    } catch (e) { /* network error, leave as -- */ }
+}
+
 async function loadPBPS() {
-    const sql = `WITH bpp AS (
+    const baseSql = `WITH bpp AS (
     SELECT *,
            file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
     FROM v_video_summary
@@ -682,20 +1276,159 @@ SELECT b.file_name,
        ROUND(b.duration_seconds / 60.0, 1) AS dur_min
 FROM bpp b
 JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-WHERE dur_min > 10
-ORDER BY ratio_vs_avg DESC`;
-    const resp = await fetch(`/api/query?sql=${encodeURIComponent(sql)}`);
-    const data = await resp.json();
-    if (data.error) {
-        document.getElementById('pbpsInfo').textContent = 'Error: ' + data.error;
+WHERE dur_min > 10`;
+
+    // Fetch worst (DESC) and best (ASC) in parallel
+    const [descResp, ascResp] = await Promise.all([
+        fetch(`/api/query?sql=${encodeURIComponent(baseSql + ' ORDER BY ratio_vs_avg DESC')}`),
+        fetch(`/api/query?sql=${encodeURIComponent(baseSql + ' ORDER BY ratio_vs_avg ASC')}`),
+    ]);
+    const descData = await descResp.json();
+    const ascData = await ascResp.json();
+    if (descData.error) {
+        document.getElementById('pbpsInfo').textContent = 'Error: ' + descData.error;
         document.getElementById('pbpsTableWrap').innerHTML = '';
         return;
     }
-    document.getElementById('pbpsInfo').textContent = `${data.total} rows returned`;
-    let html = '<table><thead><tr>' + data.columns.map(c => `<th>${escHtml(c)}</th>`).join('') + '</tr></thead><tbody>';
-    html += data.rows.map(row => '<tr>' + data.columns.map(c => `<td>${escHtml(fmt(row[c]))}</td>`).join('') + '</tr>').join('');
-    html += '</tbody></table>';
-    document.getElementById('pbpsTableWrap').innerHTML = html;
+
+    // Combine: DESC rows first, then ASC rows not already included
+    const seen = new Set(descData.rows.map(r => r.file_path));
+    const ascExtra = ascData.rows.filter(r => !seen.has(r.file_path));
+    const combined = [...descData.rows, ...ascExtra];
+
+    document.getElementById('pbpsInfo').textContent = `${combined.length} rows (worst → best)`;
+    renderSortableTable('pbpsTableWrap', descData.columns, combined);
+}
+
+// Settings panel
+async function openSettings() {
+    await loadSettings();
+    document.getElementById('settingsOverlay').classList.add('open');
+}
+
+function closeSettings() {
+    document.getElementById('settingsOverlay').classList.remove('open');
+}
+
+async function loadSettings() {
+    const resp = await fetch('/api/config');
+    const cfg = await resp.json();
+    renderList('folder', cfg.scan_folders || []);
+    renderList('pattern', cfg.ignore_patterns || []);
+    document.getElementById('ffprobePath').value = cfg.ffprobe_path || '';
+    document.getElementById('workerCount').value = cfg.workers || 8;
+}
+
+function renderList(type, items) {
+    const container = document.getElementById(type === 'folder' ? 'folderList' : 'patternList');
+    container.innerHTML = items.map((item, i) =>
+        `<div class="list-item"><span>${escHtml(item)}</span><button class="remove-btn" onclick="removeListItem('${type}',${i})">&times;</button></div>`
+    ).join('');
+    container.dataset.items = JSON.stringify(items);
+}
+
+function addListItem(type) {
+    const inputId = type === 'folder' ? 'newFolder' : 'newPattern';
+    const input = document.getElementById(inputId);
+    const val = input.value.trim();
+    if (!val) return;
+    const container = document.getElementById(type === 'folder' ? 'folderList' : 'patternList');
+    const items = JSON.parse(container.dataset.items || '[]');
+    items.push(val);
+    renderList(type, items);
+    input.value = '';
+}
+
+function removeListItem(type, idx) {
+    const container = document.getElementById(type === 'folder' ? 'folderList' : 'patternList');
+    const items = JSON.parse(container.dataset.items || '[]');
+    items.splice(idx, 1);
+    renderList(type, items);
+}
+
+async function saveSettings() {
+    const folders = JSON.parse(document.getElementById('folderList').dataset.items || '[]');
+    const patterns = JSON.parse(document.getElementById('patternList').dataset.items || '[]');
+    const config = {
+        scan_folders: folders,
+        ignore_patterns: patterns,
+        ffprobe_path: document.getElementById('ffprobePath').value.trim(),
+        workers: parseInt(document.getElementById('workerCount').value) || 8,
+    };
+    const resp = await fetch('/api/config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(config),
+    });
+    const result = await resp.json();
+    if (result.ok) closeSettings();
+    else alert('Error saving: ' + (result.error || 'unknown'));
+}
+
+// Scan
+let scanPollTimer = null;
+
+async function startScan() {
+    if (!confirm('Scanning may take a long time depending on the number of files and network speed.\n\nMake sure you have configured scan folders in Settings.\n\nContinue?')) return;
+    const resp = await fetch('/api/scan/start', { method: 'POST' });
+    const data = await resp.json();
+    if (data.error) { alert(data.error); return; }
+    document.getElementById('scanBtn').classList.add('scanning');
+    showScanToast();
+    scanPollTimer = setInterval(pollScanStatus, 2000);
+}
+
+function showScanToast() {
+    document.getElementById('scanToast').classList.add('visible');
+}
+
+function dismissScanToast() {
+    document.getElementById('scanToast').classList.remove('visible');
+    if (scanPollTimer) { clearInterval(scanPollTimer); scanPollTimer = null; }
+    document.getElementById('scanBtn').classList.remove('scanning');
+}
+
+async function pollScanStatus() {
+    try {
+        const resp = await fetch('/api/scan/status');
+        const s = await resp.json();
+        const phase = document.getElementById('scanPhase');
+        const bar = document.getElementById('scanProgressBar');
+        const detail = document.getElementById('scanDetail');
+
+        const labels = { discovering: 'Discovering files...', checking: 'Checking timestamps...', probing: 'Probing files...',
+                         swapping: 'Finalizing...', done: 'Complete', error: 'Error', starting: 'Starting...' };
+        phase.textContent = labels[s.phase] || s.phase;
+
+        if (s.total > 0) {
+            const pct = Math.round((s.done / s.total) * 100);
+            bar.style.width = pct + '%';
+            detail.textContent = `${s.done.toLocaleString()} / ${s.total.toLocaleString()} files` + (s.errors ? ` (${s.errors} errors)` : '');
+        } else {
+            bar.style.width = '0%';
+            detail.textContent = s.message || '';
+        }
+
+        if (s.phase === 'error') {
+            bar.classList.add('error');
+            detail.textContent = s.message;
+        } else {
+            bar.classList.remove('error');
+        }
+
+        if (!s.running) {
+            clearInterval(scanPollTimer);
+            scanPollTimer = null;
+            document.getElementById('scanBtn').classList.remove('scanning');
+            if (s.phase === 'done') {
+                bar.style.width = '100%';
+                loadData();  // refresh current view
+                loadPBPSTiles(true);  // refresh tiles (force, cache invalidated server-side)
+            }
+        }
+    } catch (e) {
+        // network error, keep polling
+    }
 }
 
 init();
@@ -711,15 +1444,23 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     args = parser.parse_args()
 
-    global DB_PATH
+    global DB_PATH, CONFIG_PATH
     DB_PATH = args.db
+    CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(DB_PATH)),
+        "media_analyser_config.json",
+    )
 
     if not os.path.exists(DB_PATH):
         print(f"Database not found: {DB_PATH}")
         return
 
-    server = HTTPServer(("0.0.0.0", args.port), APIHandler)
-    print(f"Serving at http://localhost:{args.port}")
+    # Set console window title on Windows
+    if os.name == "nt":
+        os.system("title Media File Analyser")
+
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), APIHandler)
+    print(f"Media File Analyser serving at http://localhost:{args.port}")
     print(f"Database: {DB_PATH}")
     try:
         server.serve_forever()

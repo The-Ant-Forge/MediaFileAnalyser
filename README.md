@@ -44,6 +44,16 @@ python3 analyse_media.py --db media.db sql
 
 Available commands: `summary`, `codec-stats`, `resolution`, `codecs`, `largest`, `smallest`, `sql`
 
+
+### 3. Web based views
+
+"""
+
+Usage:
+    python web_viewer.py [--db media.db] [--port 8081]
+"""
+py web_viewer.py --db media.db --port 8081
+
 ## Database Schema
 
 - **files** — One row per video file (path, size, duration, format, raw probe JSON)

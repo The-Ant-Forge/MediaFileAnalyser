@@ -11,3 +11,6 @@ __pycache__/
 
 # Output
 stats.txt
+
+# Config
+media_analyser_config.json

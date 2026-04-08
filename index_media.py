@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS files (
     probe_score INTEGER,
     format_tags_json TEXT,
     raw_probe_json TEXT,
+    file_mtime REAL,
     indexed_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -175,8 +176,16 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(DB_SCHEMA)
+    _migrate_db(conn)
     conn.commit()
     return conn
+
+
+def _migrate_db(conn: sqlite3.Connection):
+    """Add columns that may be missing from older databases."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+    if "file_mtime" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN file_mtime REAL")
 
 
 def find_video_files(paths: list[str]) -> list[str]:
@@ -200,17 +209,17 @@ def find_video_files(paths: list[str]) -> list[str]:
     return files
 
 
-def probe_file(filepath: str, timeout: int = 120) -> dict | None:
+def probe_file(filepath: str, timeout: int = 120, ffprobe_cmd: str = "ffprobe") -> dict | None:
     """Run ffprobe on a file and return parsed JSON."""
     try:
         result = subprocess.run(
             [
-                "ffprobe", "-v", "quiet",
+                ffprobe_cmd, "-v", "quiet",
                 "-print_format", "json",
                 "-show_format", "-show_streams",
                 filepath,
             ],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode != 0:
             return None
@@ -238,7 +247,8 @@ def safe_float(val) -> float | None:
         return None
 
 
-def insert_file(conn: sqlite3.Connection, filepath: str, probe: dict) -> int | None:
+def insert_file(conn: sqlite3.Connection, filepath: str, probe: dict,
+                file_mtime: float | None = None) -> int | None:
     fmt = probe.get("format", {})
     tags = fmt.get("tags", {})
 
@@ -247,8 +257,8 @@ def insert_file(conn: sqlite3.Connection, filepath: str, probe: dict) -> int | N
             """INSERT INTO files
                (file_path, file_name, file_size_bytes, format_name, format_long_name,
                 duration_seconds, bit_rate, nb_streams, probe_score,
-                format_tags_json, raw_probe_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                format_tags_json, raw_probe_json, file_mtime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 filepath,
                 os.path.basename(filepath),
@@ -261,6 +271,7 @@ def insert_file(conn: sqlite3.Connection, filepath: str, probe: dict) -> int | N
                 safe_int(fmt.get("probe_score")),
                 json.dumps(tags) if tags else None,
                 json.dumps(probe),
+                file_mtime,
             ),
         )
         return cur.lastrowid
