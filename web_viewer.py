@@ -348,11 +348,13 @@ joined AS (
     WHERE b.duration_seconds / 60.0 > 10
 )
 SELECT
-    SUM(CASE WHEN ratio_vs_avg > 2 THEN 1 ELSE 0 END) AS rva_up_count,
+    SUM(CASE WHEN ratio_vs_avg > 1.5 THEN 1 ELSE 0 END) AS rva_up_count,
     SUM(CASE WHEN ratio_vs_avg < 0.5 THEN 1 ELSE 0 END) AS rva_down_count,
     ROUND(AVG(bpp_sec), 6) AS mean_bpp_sec,
     SUM(CASE WHEN video_codec = 'h264' THEN 1 ELSE 0 END) AS h264_count,
     SUM(CASE WHEN resolution_class IN ('720p', '480p', 'other') THEN 1 ELSE 0 END) AS low_res_count,
+    SUM(CASE WHEN video_codec = 'av1' THEN 1 ELSE 0 END) AS av1_count,
+    SUM(CASE WHEN resolution_class IN ('4K', '1080p') THEN 1 ELSE 0 END) AS high_res_count,
     COUNT(*) AS total_files
 FROM joined
 """
@@ -372,12 +374,85 @@ LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM bpp WHERE duration_seconds / 60.0 > 10)
 """
 
 
+PBPS_CODEC_SQL = """
+WITH bpp AS (
+    SELECT video_codec, duration_seconds
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+      AND duration_seconds / 60.0 > 10
+)
+SELECT video_codec, COUNT(*) AS cnt
+FROM bpp
+GROUP BY video_codec
+ORDER BY cnt DESC
+"""
+
+
 def compute_pbps_tiles():
     conn = get_db()
     try:
         row = dict(conn.execute(PBPS_TILES_SQL).fetchone())
         median_row = conn.execute(PBPS_MEDIAN_SQL).fetchone()
         row["median_bpp_sec"] = median_row["median_bpp_sec"] if median_row else None
+
+        # Top 3 codecs + other
+        codec_rows = conn.execute(PBPS_CODEC_SQL).fetchall()
+        codecs = []
+        other_count = 0
+        for i, cr in enumerate(codec_rows):
+            if i < 3:
+                codecs.append({"name": cr["video_codec"], "count": cr["cnt"]})
+            else:
+                other_count += cr["cnt"]
+        if other_count > 0:
+            codecs.append({"name": "other", "count": other_count})
+        row["codecs"] = codecs
+
+        # Ratio distribution histogram (0.1-wide buckets, 0.4 to 1.6)
+        hist_rows = conn.execute("""
+            WITH bpp AS (
+                SELECT *,
+                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+                FROM v_video_summary
+                WHERE width > 0 AND height > 0 AND duration_seconds > 60
+            ),
+            avg_bpp AS (
+                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+                FROM bpp GROUP BY resolution_class
+            ),
+            joined AS (
+                SELECT b.bpp_sec / a.avg_bpp_sec AS ratio
+                FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+                WHERE b.duration_seconds / 60.0 > 10
+                  AND b.bpp_sec / a.avg_bpp_sec >= 0.4
+                  AND b.bpp_sec / a.avg_bpp_sec < 1.6
+            ),
+            buckets AS (
+                SELECT CAST(ratio / 0.1 AS INTEGER) AS bucket,
+                       COUNT(*) AS cnt
+                FROM joined GROUP BY bucket
+            )
+            SELECT bucket, cnt FROM buckets ORDER BY bucket
+        """).fetchall()
+        row["ratio_hist"] = [{"bucket": r["bucket"], "count": r["cnt"]} for r in hist_rows]
+
+        # Resolution distribution
+        res_rows = conn.execute("""
+            SELECT resolution_class, COUNT(*) AS cnt
+            FROM v_video_summary
+            WHERE width > 0 AND height > 0 AND duration_seconds > 60
+              AND duration_seconds / 60.0 > 10
+            GROUP BY resolution_class
+        """).fetchall()
+        res_map = {r["resolution_class"]: r["cnt"] for r in res_rows}
+        row["resolution"] = [
+            {"name": "4K", "count": res_map.get("4K", 0)},
+            {"name": "1080p", "count": res_map.get("1080p", 0)},
+            {"name": "720p", "count": res_map.get("720p", 0)},
+            {"name": "480p", "count": res_map.get("480p", 0)},
+            {"name": "other", "count": res_map.get("other", 0)},
+        ]
+
         return row
     finally:
         conn.close()
@@ -706,7 +781,7 @@ th:hover { background: var(--accent2); }
 th .sort-arrow { margin-left: 4px; font-size: 0.7em; }
 td { padding: 4px 8px; border-bottom: 1px solid #1a1a3e; white-space: nowrap;
      max-width: 400px; overflow: hidden; text-overflow: ellipsis; }
-tr:hover td { background: rgba(233,69,96,0.08); }
+tr:hover td { background: rgba(233,69,96,0.18); }
 
 /* Stats */
 .stats-table { font-size: 0.82em; }
@@ -766,12 +841,38 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
 /* Score tiles */
 .score-tiles { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
 .score-tile { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-              padding: 12px 18px; min-width: 130px; flex: 1; text-align: center; }
-.score-tile .tile-value { font-size: 1.6em; font-weight: 700; color: var(--green); line-height: 1.2; }
-.score-tile .tile-label { font-size: 0.75em; color: var(--text2); margin-top: 2px; }
+              padding: 12px 18px; min-width: 130px; flex: 1; text-align: center;
+              display: flex; flex-direction: column; }
+.score-tile .tile-label { font-size: 0.75em; color: var(--text2); margin-bottom: 4px; }
+.score-tile .tile-value { font-size: 1.6em; font-weight: 700; color: var(--green); line-height: 1.2; flex: 1;
+              display: flex; align-items: center; justify-content: center; }
 .score-tile.warn .tile-value { color: var(--accent); }
 .score-tile.neutral .tile-value { color: var(--text); }
 .tile-pct { font-size: 0.5em; color: var(--text2); font-weight: 400; }
+
+/* Mini bar chart in tiles */
+.mini-bars { display: flex; align-items: flex-end; gap: 6px; height: 48px; }
+.mini-bar { display: flex; flex-direction: column; align-items: center; flex: 1; height: 100%; justify-content: flex-end; }
+.mini-bar-fill { width: 100%; min-width: 24px; border-radius: 3px 3px 0 0; transition: height 0.3s ease; }
+.mini-bar-label { font-size: 0.6em; color: var(--text2); margin-top: 2px; white-space: nowrap; }
+.mini-bar-count { font-size: 0.65em; color: var(--text); font-weight: 600; margin-bottom: 1px; }
+
+/* Ratio distribution histogram */
+.ratio-hist { display: flex; align-items: flex-end; gap: 1px; height: 44px; position: relative; }
+.ratio-hist .rh-bar { flex: 1; min-width: 0; border-radius: 2px 2px 0 0; position: relative; }
+.ratio-hist .rh-bar:hover::after { content: attr(data-tip); position: absolute; bottom: 100%; left: 50%;
+    transform: translateX(-50%); background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 2px 6px; border-radius: 3px; font-size: 0.65em; white-space: nowrap; z-index: 5; }
+.ratio-hist .rh-line { position: absolute; bottom: 0; top: 0; width: 1px; background: var(--text); opacity: 0.6; pointer-events: none; }
+.ratio-hist-labels { display: flex; justify-content: space-between; font-size: 0.55em; color: var(--text2); margin-top: 1px; }
+
+/* Clickable cells */
+td.clickable { cursor: pointer; color: var(--green); }
+td.clickable:hover { text-decoration: underline; }
+td.clickable-path { cursor: pointer; }
+td.clickable-path:hover { color: var(--green); }
+.copied-flash { animation: flash-green 0.6s ease; }
+@keyframes flash-green { 0% { background: var(--green); color: #000; } 100% {} }
 
 /* Scan toast */
 .scan-toast { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface);
@@ -804,6 +905,16 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
     <div class="tab" data-section="chart-section">Charts</div>
     <div class="tab" data-section="pbps-section">Normalized PBPS</div>
     <div class="tab" data-section="sql-section">SQL Console</div>
+</div>
+
+<div class="score-tiles" id="scoreTiles">
+    <div class="score-tile warn" id="tileRVA"><div class="tile-label">RVA</div><div class="tile-value" style="font-size:1.3em;display:block"><span style="color:var(--text2);font-size:0.7em">&gt;1.5x </span><span id="tileRVAUp">--</span><br><span style="color:var(--text2);font-size:0.7em">&lt;0.5x </span><span id="tileRVADown">--</span></div></div>
+    <div class="score-tile neutral" id="tileBPP"><div class="tile-label">BPP/sec</div><div class="tile-value" style="font-size:1.3em;display:block"><span style="color:var(--text2);font-size:0.7em">med </span><span id="tileBPPMedian">--</span><br><span style="color:var(--text2);font-size:0.7em">avg </span><span id="tileBPPMean">--</span></div></div>
+    <div class="score-tile" id="tileCodecs" style="min-width:180px"><div class="tile-label">Codecs</div><div class="mini-bars" id="codecBars">--</div></div>
+    <div class="score-tile" id="tileResDist" style="min-width:180px"><div class="tile-label">Resolution</div><div class="mini-bars" id="resBars">--</div></div>
+    <div class="score-tile" id="tileRatioDist" style="min-width:240px"><div class="tile-label">Ratio Distribution</div><div class="ratio-hist" id="ratioHist">--</div></div>
+    <div class="score-tile warn" id="tileLegacy"><div class="tile-label">Legacy</div><div class="tile-value" style="font-size:1.1em;display:block"><span style="color:var(--text2);font-size:0.65em">h264 </span><span id="tileLegH264">--</span><br><span style="color:var(--text2);font-size:0.65em">&le;720p </span><span id="tileLeg720p">--</span></div></div>
+    <div class="score-tile" id="tileModern"><div class="tile-label">Modern</div><div class="tile-value" style="font-size:1.1em;display:block;color:var(--green)"><span style="color:var(--text2);font-size:0.65em">av1 </span><span id="tileModAV1">--</span><br><span style="color:var(--text2);font-size:0.65em">&ge;1080p </span><span id="tileMod1080p">--</span></div></div>
 </div>
 
 <!-- DATA BROWSER -->
@@ -881,14 +992,6 @@ textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; r
 
 <!-- NORMALIZED PBPS -->
 <div class="section" id="pbps-section">
-<div class="score-tiles" id="pbpsTiles">
-    <div class="score-tile warn" id="tileRVAUp"><div class="tile-value">--</div><div class="tile-label">R&#9650;A (&gt;2x avg)</div></div>
-    <div class="score-tile warn" id="tileRVADown"><div class="tile-value">--</div><div class="tile-label">R&#9660;A (&lt;0.5x avg)</div></div>
-    <div class="score-tile neutral" id="tileMedianBPP"><div class="tile-value">--</div><div class="tile-label">Median BPP/sec</div></div>
-    <div class="score-tile neutral" id="tileMeanBPP"><div class="tile-value">--</div><div class="tile-label">Mean BPP/sec</div></div>
-    <div class="score-tile" id="tileH264"><div class="tile-value">--</div><div class="tile-label">h264 Files</div></div>
-    <div class="score-tile" id="tile720p"><div class="tile-value">--</div><div class="tile-label">&le;720p Files</div></div>
-</div>
 <div class="panel">
     <p class="info">Per-pixel Bytes Per Second normalized against resolution class average. Shows files with duration &gt; 10 minutes, ordered by ratio vs average (highest first).</p>
     <button onclick="loadPBPS()">Run Analysis</button>
@@ -969,7 +1072,6 @@ document.querySelectorAll('.tab').forEach(tab => {
         document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById(tab.dataset.section).classList.add('active');
-        if (tab.dataset.section === 'pbps-section') loadPBPSTiles();
     });
 });
 
@@ -990,6 +1092,7 @@ async function init() {
     loadData();
     loadStatsColumns();
     loadChartColumns();
+    loadPBPSTiles();
 }
 
 // Data browser
@@ -1053,7 +1156,12 @@ function renderSortableTable(wrapId, columns, rows) {
     let html = '<table><thead><tr>' + s.columns.map(c =>
         `<th onclick="sortTableCol('${wrapId}','${c.replace(/'/g,"\\'")}')">${escHtml(c)}<span class="sort-arrow">${arrow(c)}</span></th>`
     ).join('') + '</tr></thead><tbody>';
-    html += sorted.map(row => '<tr>' + s.columns.map(c => `<td title="${escHtml(String(row[c] ?? ''))}">${escHtml(fmt(row[c]))}</td>`).join('') + '</tr>').join('');
+    html += sorted.map(row => '<tr>' + s.columns.map(c => {
+        let cls = '';
+        if (c === 'file_name') cls = ' class="clickable"';
+        else if (c === 'file_path') cls = ' class="clickable-path"';
+        return `<td${cls} data-col="${escHtml(c)}" title="${escHtml(String(row[c] ?? ''))}">${escHtml(fmt(row[c]))}</td>`;
+    }).join('') + '</tr>').join('');
     html += '</tbody></table>';
     document.getElementById(wrapId).innerHTML = html;
 }
@@ -1064,6 +1172,44 @@ function sortTableCol(wrapId, col) {
     else { s.col = col; s.dir = 'asc'; }
     renderSortableTable(wrapId);
 }
+
+// Click handlers for file_name (geekseek) and file_path (copy to clipboard)
+document.getElementById('pbpsTableWrap').addEventListener('click', function(e) {
+    const td = e.target.closest('td');
+    if (!td) return;
+    const col = td.dataset.col;
+    const tr = td.closest('tr');
+    if (!tr) return;
+
+    if (col === 'file_name') {
+        // Get file_path from the same row to determine Movie vs TV
+        const pathTd = tr.querySelector('td[data-col="file_path"]');
+        const filePath = pathTd ? pathTd.title : '';
+        const isTV = /\\TV\\/i.test(filePath) || /\/TV\//i.test(filePath);
+        const category = isTV ? '5000' : '2000';
+
+        // Clean filename: strip extension, replace dots/underscores with spaces
+        let name = td.title || '';
+        name = name.replace(/\.[^.]+$/, '');           // strip extension
+        name = name.replace(/\{[^}]*\}/g, '');          // strip {edition-Criterion} etc.
+        name = name.replace(/[._]/g, ' ');              // dots/underscores → spaces
+        name = name.replace(/\s*S\d{1,2}E\d{1,2}.*/i, ''); // strip S01E02... for TV
+        name = name.replace(/\s*(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|aac|bluray|bdrip|webrip|web-dl|hdtv|remux|dts|atmos)\b.*/i, ''); // strip quality tags
+        name = name.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/, ''); // strip trailing (2023) or [2023]
+        name = name.trim();
+
+        const url = `https://nzbgeek.info/geekseek.php?moviesgeekseek=1&c=${category}&browseincludewords=${encodeURIComponent(name)}`;
+        window.open(url, '_blank');
+    }
+
+    if (col === 'file_path') {
+        const path = td.title || td.textContent;
+        navigator.clipboard.writeText(path).then(() => {
+            td.classList.add('copied-flash');
+            setTimeout(() => td.classList.remove('copied-flash'), 600);
+        });
+    }
+});
 
 function sortBy(col) {
     if (currentSort === col) currentDir = currentDir === 'asc' ? 'desc' : 'asc';
@@ -1239,15 +1385,67 @@ async function loadPBPSTiles(force) {
         const resp = await fetch('/api/pbps/tiles');
         const t = await resp.json();
         if (t.error) return;
-        document.querySelector('#tileRVAUp .tile-value').textContent = (t.rva_up_count ?? 0).toLocaleString();
-        document.querySelector('#tileRVADown .tile-value').textContent = (t.rva_down_count ?? 0).toLocaleString();
-        document.querySelector('#tileMedianBPP .tile-value').textContent = t.median_bpp_sec != null ? t.median_bpp_sec : '--';
-        document.querySelector('#tileMeanBPP .tile-value').textContent = t.mean_bpp_sec != null ? t.mean_bpp_sec : '--';
+
+        // RVA combined tile
+        document.getElementById('tileRVAUp').textContent = (t.rva_up_count ?? 0).toLocaleString();
+        document.getElementById('tileRVADown').textContent = (t.rva_down_count ?? 0).toLocaleString();
+
+        // BPP
+        document.getElementById('tileBPPMedian').textContent = t.median_bpp_sec != null ? Number(t.median_bpp_sec).toPrecision(3) : '--';
+        document.getElementById('tileBPPMean').textContent = t.mean_bpp_sec != null ? Number(t.mean_bpp_sec).toPrecision(3) : '--';
+
+        // Legacy (red) and Modern (green) tiles
         const total = t.total_files || 1;
         const h264 = t.h264_count ?? 0;
         const lowRes = t.low_res_count ?? 0;
-        document.querySelector('#tileH264 .tile-value').innerHTML = `${h264.toLocaleString()} <span class="tile-pct">(${Math.round(h264/total*100)}%)</span>`;
-        document.querySelector('#tile720p .tile-value').innerHTML = `${lowRes.toLocaleString()} <span class="tile-pct">(${Math.round(lowRes/total*100)}%)</span>`;
+        const av1 = t.av1_count ?? 0;
+        const highRes = t.high_res_count ?? 0;
+        document.getElementById('tileLegH264').innerHTML = `${h264.toLocaleString()} <span class="tile-pct">(${Math.round(h264/total*100)}%)</span>`;
+        document.getElementById('tileLeg720p').innerHTML = `${lowRes.toLocaleString()} <span class="tile-pct">(${Math.round(lowRes/total*100)}%)</span>`;
+        document.getElementById('tileModAV1').innerHTML = `${av1.toLocaleString()} <span class="tile-pct">(${Math.round(av1/total*100)}%)</span>`;
+        document.getElementById('tileMod1080p').innerHTML = `${highRes.toLocaleString()} <span class="tile-pct">(${Math.round(highRes/total*100)}%)</span>`;
+
+        // Codec mini histogram
+        const codecs = t.codecs || [];
+        const maxCount = Math.max(...codecs.map(c => c.count), 1);
+        const codecColors = ['var(--green)', 'var(--accent2)', '#e0a030', 'var(--border)'];
+        document.getElementById('codecBars').innerHTML = codecs.map((c, i) => {
+            const pct = Math.round(c.count / maxCount * 100);
+            return `<div class="mini-bar"><span class="mini-bar-count">${c.count.toLocaleString()}</span><div class="mini-bar-fill" style="height:${pct}%;background:${codecColors[i] || codecColors[3]}"></div><span class="mini-bar-label">${escHtml(c.name)}</span></div>`;
+        }).join('');
+
+        // Resolution mini histogram
+        const resData = t.resolution || [];
+        const maxRes = Math.max(...resData.map(r => r.count), 1);
+        const resColors = ['var(--green)', 'var(--green)', '#e0a030', 'var(--accent)', 'var(--border)'];
+        document.getElementById('resBars').innerHTML = resData.map((r, i) => {
+            const pct = Math.round(r.count / maxRes * 100);
+            return `<div class="mini-bar"><span class="mini-bar-count">${r.count.toLocaleString()}</span><div class="mini-bar-fill" style="height:${pct}%;background:${resColors[i] || resColors[4]}"></div><span class="mini-bar-label">${escHtml(r.name)}</span></div>`;
+        }).join('');
+
+        // Ratio distribution histogram (0.1 buckets, 0.4–1.6)
+        const hist = t.ratio_hist || [];
+        const NUM_BARS = 12, START_BUCKET = 4;
+        const buckets = new Array(NUM_BARS).fill(0);
+        for (const h of hist) {
+            const idx = h.bucket - START_BUCKET;
+            if (idx >= 0 && idx < NUM_BARS) buckets[idx] = h.count;
+        }
+        const maxH = Math.max(...buckets, 1);
+        const linePos = (6.5 / NUM_BARS) * 100;
+        let histHtml = `<div class="rh-line" style="left:${linePos}%"></div>`;
+        // Color gradient: red at edges → green at center (index 6)
+        histHtml += buckets.map((cnt, i) => {
+            const lo = ((START_BUCKET + i) * 0.1).toFixed(1);
+            const hi = ((START_BUCKET + i + 1) * 0.1).toFixed(1);
+            const pct = Math.round(cnt / maxH * 100);
+            const dist = Math.abs(i - 6);
+            const color = dist === 0 ? 'var(--green)' : dist <= 2 ? '#4e8' : dist <= 4 ? '#e0a030' : 'var(--accent)';
+            return `<div class="rh-bar" style="height:${Math.max(pct, 2)}%;background:${color}" data-tip="${lo}–${hi}: ${cnt.toLocaleString()}"></div>`;
+        }).join('');
+        document.getElementById('ratioHist').innerHTML = histHtml +
+            '<div class="ratio-hist-labels" style="position:absolute;bottom:-10px;left:0;right:0"><span>0.4</span><span>1.0</span><span>1.6</span></div>';
+
         pbpsTilesLoaded = true;
     } catch (e) { /* network error, leave as -- */ }
 }
