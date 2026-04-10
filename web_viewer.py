@@ -1032,7 +1032,7 @@ td.clickable-path:hover { color: var(--green); }
     <div class="score-tile" id="tileResDist" style="min-width:180px"><div class="tile-label">Resolution</div><div class="mini-bars" id="resBars">--</div></div>
     <div class="score-tile" id="tileRatioDist" style="min-width:240px"><div class="tile-label">Ratio Distribution</div><div class="ratio-hist" id="ratioHist">--</div></div>
     <div class="score-tile warn" id="tileLegacy"><div class="tile-label">Legacy</div><div class="tile-value" style="font-size:1.3em;display:block"><span style="color:var(--text2);font-size:0.7em">h264 </span><span id="tileLegH264">--</span><br><span style="color:var(--text2);font-size:0.7em">&le;720p </span><span id="tileLeg720p">--</span></div></div>
-    <div class="score-tile" id="tileModern"><div class="tile-label">Modern</div><div class="tile-value" style="font-size:1.3em;display:block;color:var(--green)"><span style="color:var(--text2);font-size:0.7em">av1 </span><span id="tileModAV1">--</span><br><span style="color:var(--text2);font-size:0.7em">&ge;1080p </span><span id="tileMod1080p">--</span></div></div>
+    <div class="score-tile" id="tileModern"><div class="tile-label">Modern</div><div class="tile-value" style="font-size:1.3em;display:block;color:var(--green)"><span style="color:var(--text2);font-size:0.7em">av1 </span><span id="tileModAV1">--</span><br><span style="color:var(--text2);font-size:0.7em">&ge;FHD </span><span id="tileMod1080p">--</span></div></div>
 </div>
 
 <!-- DATA BROWSER -->
