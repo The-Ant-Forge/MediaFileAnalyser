@@ -298,6 +298,7 @@ def run_scan():
                     pass
 
         invalidate_pbps_tiles_cache()
+        invalidate_distributions_cache()
         with scan_lock:
             scan_state.update(running=False, phase="done",
                               message=f"Scan complete: {done} files ({skipped} cached, {len(to_probe)} probed, {errors} errors)")
@@ -468,6 +469,114 @@ def invalidate_pbps_tiles_cache():
     _pbps_tiles_cache["data"] = None
 
 
+# ---------------------------------------------------------------------------
+# Distributions cache — ratio buckets broken down by codec and resolution
+# ---------------------------------------------------------------------------
+_distributions_cache = {"data": None}
+
+DISTRIBUTIONS_SQL = """
+WITH bpp AS (
+    SELECT *,
+           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+),
+avg_bpp AS (
+    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+    FROM bpp GROUP BY resolution_class
+),
+joined AS (
+    SELECT b.video_codec, b.resolution_class,
+           b.bpp_sec / a.avg_bpp_sec AS ratio
+    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+    WHERE b.duration_seconds / 60.0 > 10
+      AND b.bpp_sec / a.avg_bpp_sec >= 0.4
+      AND b.bpp_sec / a.avg_bpp_sec < 1.6
+)
+SELECT CAST(ratio / 0.1 AS INTEGER) AS bucket,
+       video_codec, resolution_class,
+       COUNT(*) AS cnt
+FROM joined
+GROUP BY bucket, video_codec, resolution_class
+ORDER BY bucket
+"""
+
+
+def compute_distributions():
+    conn = get_db()
+    try:
+        rows = conn.execute(DISTRIBUTIONS_SQL).fetchall()
+        # Build two breakdowns: by codec and by resolution
+        codec_data = {}   # bucket -> {codec: count}
+        res_data = {}     # bucket -> {resolution: count}
+        all_codecs = set()
+        all_res = set()
+
+        for r in rows:
+            b = r["bucket"]
+            codec = r["video_codec"]
+            res = r["resolution_class"]
+            cnt = r["cnt"]
+
+            all_codecs.add(codec)
+            all_res.add(res)
+
+            if b not in codec_data:
+                codec_data[b] = {}
+            codec_data[b][codec] = codec_data[b].get(codec, 0) + cnt
+
+            if b not in res_data:
+                res_data[b] = {}
+            res_data[b][res] = res_data[b].get(res, 0) + cnt
+
+        # Top codecs (keep top 5, rest as "other")
+        codec_totals = {}
+        for bd in codec_data.values():
+            for c, n in bd.items():
+                codec_totals[c] = codec_totals.get(c, 0) + n
+        top_codecs = sorted(codec_totals, key=codec_totals.get, reverse=True)[:5]
+
+        # Collapse non-top codecs into "other"
+        codec_clean = {}
+        for b, bd in codec_data.items():
+            codec_clean[b] = {}
+            for c, n in bd.items():
+                key = c if c in top_codecs else "other"
+                codec_clean[b][key] = codec_clean[b].get(key, 0) + n
+        final_codecs = top_codecs + (["other"] if any("other" in v for v in codec_clean.values()) else [])
+
+        # Fixed resolution order
+        res_order = ["4K", "1080p", "720p", "480p", "other"]
+
+        # Build bucket range 4..15
+        buckets = list(range(4, 16))
+        bucket_labels = [f"{b * 0.1:.1f}" for b in buckets]
+
+        return {
+            "buckets": bucket_labels,
+            "codec_series": [
+                {"name": c, "values": [codec_clean.get(b, {}).get(c, 0) for b in buckets]}
+                for c in final_codecs
+            ],
+            "res_series": [
+                {"name": r, "values": [res_data.get(b, {}).get(r, 0) for b in buckets]}
+                for r in res_order
+            ],
+        }
+    finally:
+        conn.close()
+
+
+def get_distributions():
+    if _distributions_cache["data"] is None:
+        _distributions_cache["data"] = compute_distributions()
+    return _distributions_cache["data"]
+
+
+def invalidate_distributions_cache():
+    _distributions_cache["data"] = None
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default access logs
@@ -509,6 +618,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_scan_status()
         elif path == "/api/pbps/tiles":
             self.handle_pbps_tiles()
+        elif path == "/api/distributions":
+            self.handle_distributions()
         else:
             self.send_response(404)
             self.end_headers()
@@ -554,6 +665,12 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_pbps_tiles(self):
         try:
             self.send_json(get_pbps_tiles())
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_distributions(self):
+        try:
+            self.send_json(get_distributions())
         except Exception as e:
             self.send_json({"error": str(e)}, 500)
 
@@ -904,6 +1021,7 @@ td.clickable-path:hover { color: var(--green); }
     <div class="tab" data-section="stats-section">Statistics</div>
     <div class="tab" data-section="chart-section">Charts</div>
     <div class="tab" data-section="pbps-section">Normalized PBPS</div>
+    <div class="tab" data-section="dist-section">Distributions</div>
     <div class="tab" data-section="sql-section">SQL Console</div>
 </div>
 
@@ -913,8 +1031,8 @@ td.clickable-path:hover { color: var(--green); }
     <div class="score-tile" id="tileCodecs" style="min-width:180px"><div class="tile-label">Codecs</div><div class="mini-bars" id="codecBars">--</div></div>
     <div class="score-tile" id="tileResDist" style="min-width:180px"><div class="tile-label">Resolution</div><div class="mini-bars" id="resBars">--</div></div>
     <div class="score-tile" id="tileRatioDist" style="min-width:240px"><div class="tile-label">Ratio Distribution</div><div class="ratio-hist" id="ratioHist">--</div></div>
-    <div class="score-tile warn" id="tileLegacy"><div class="tile-label">Legacy</div><div class="tile-value" style="font-size:1.1em;display:block"><span style="color:var(--text2);font-size:0.65em">h264 </span><span id="tileLegH264">--</span><br><span style="color:var(--text2);font-size:0.65em">&le;720p </span><span id="tileLeg720p">--</span></div></div>
-    <div class="score-tile" id="tileModern"><div class="tile-label">Modern</div><div class="tile-value" style="font-size:1.1em;display:block;color:var(--green)"><span style="color:var(--text2);font-size:0.65em">av1 </span><span id="tileModAV1">--</span><br><span style="color:var(--text2);font-size:0.65em">&ge;1080p </span><span id="tileMod1080p">--</span></div></div>
+    <div class="score-tile warn" id="tileLegacy"><div class="tile-label">Legacy</div><div class="tile-value" style="font-size:1.3em;display:block"><span style="color:var(--text2);font-size:0.7em">h264 </span><span id="tileLegH264">--</span><br><span style="color:var(--text2);font-size:0.7em">&le;720p </span><span id="tileLeg720p">--</span></div></div>
+    <div class="score-tile" id="tileModern"><div class="tile-label">Modern</div><div class="tile-value" style="font-size:1.3em;display:block;color:var(--green)"><span style="color:var(--text2);font-size:0.7em">av1 </span><span id="tileModAV1">--</span><br><span style="color:var(--text2);font-size:0.7em">&ge;1080p </span><span id="tileMod1080p">--</span></div></div>
 </div>
 
 <!-- DATA BROWSER -->
@@ -997,6 +1115,19 @@ td.clickable-path:hover { color: var(--green); }
     <button onclick="loadPBPS()">Run Analysis</button>
     <span id="pbpsInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
     <div class="table-wrap" id="pbpsTableWrap" style="margin-top:12px"></div>
+</div>
+</div>
+
+<!-- DISTRIBUTIONS -->
+<div class="section" id="dist-section">
+<div class="panel">
+    <p class="info">Ratio vs Average distribution broken down by codec and resolution. Bars show file counts in 0.1-wide ratio buckets (0.4–1.6). Vertical line marks 1.0 (average).</p>
+    <button onclick="loadDistributions()">Load Charts</button>
+    <span id="distInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    <h2>By Video Codec</h2>
+    <div id="distCodecChart" style="min-height:400px"></div>
+    <h2>By Resolution</h2>
+    <div id="distResChart" style="min-height:400px"></div>
 </div>
 </div>
 
@@ -1498,6 +1629,50 @@ WHERE dur_min > 10`;
     renderSortableTable('pbpsTableWrap', descData.columns, combined);
 }
 
+// Distributions
+let distLoaded = false;
+
+async function loadDistributions(force) {
+    if (distLoaded && !force) { document.getElementById('distInfo').textContent = '(cached)'; return; }
+    document.getElementById('distInfo').textContent = 'Loading...';
+    const resp = await fetch('/api/distributions');
+    const d = await resp.json();
+    if (d.error) { document.getElementById('distInfo').textContent = 'Error: ' + d.error; return; }
+
+    const darkLayout = {
+        paper_bgcolor: '#1a1a2e', plot_bgcolor: '#16213e',
+        font: { color: '#e0e0e0' },
+        xaxis: { title: 'Ratio vs Average', gridcolor: '#0f3460' },
+        yaxis: { title: 'File Count', gridcolor: '#0f3460' },
+        barmode: 'stack',
+        margin: { t: 30, r: 20 },
+        shapes: [{
+            type: 'line', x0: '1.0', x1: '1.0', y0: 0, y1: 1, yref: 'paper',
+            line: { color: '#e0e0e0', width: 1.5 }
+        }],
+        legend: { orientation: 'h', y: -0.15 },
+    };
+
+    // Codec chart
+    const codecColors = ['#4ecca3', '#533483', '#e0a030', '#e94560', '#5b8def', '#888'];
+    const codecTraces = d.codec_series.map((s, i) => ({
+        x: d.buckets, y: s.values, name: s.name, type: 'bar',
+        marker: { color: codecColors[i % codecColors.length] },
+    }));
+    Plotly.newPlot('distCodecChart', codecTraces, {...darkLayout, xaxis: {...darkLayout.xaxis, title: 'Ratio vs Average (by Codec)'}}, { responsive: true });
+
+    // Resolution chart
+    const resColors = { '4K': '#4ecca3', '1080p': '#5b8def', '720p': '#e0a030', '480p': '#e94560', 'other': '#888' };
+    const resTraces = d.res_series.map(s => ({
+        x: d.buckets, y: s.values, name: s.name, type: 'bar',
+        marker: { color: resColors[s.name] || '#888' },
+    }));
+    Plotly.newPlot('distResChart', resTraces, {...darkLayout, xaxis: {...darkLayout.xaxis, title: 'Ratio vs Average (by Resolution)'}}, { responsive: true });
+
+    document.getElementById('distInfo').textContent = '';
+    distLoaded = true;
+}
+
 // Settings panel
 async function openSettings() {
     await loadSettings();
@@ -1622,6 +1797,7 @@ async function pollScanStatus() {
                 bar.style.width = '100%';
                 loadData();  // refresh current view
                 loadPBPSTiles(true);  // refresh tiles (force, cache invalidated server-side)
+                distLoaded = false;  // invalidate distributions client cache
             }
         }
     } catch (e) {
