@@ -19,22 +19,40 @@ from urllib.parse import urlparse, parse_qs
 
 DB_PATH = "media.db"
 CONFIG_PATH = "media_analyser_config.json"
+CONFIG_DIR = "."  # resolved in main()
 
 DEFAULT_CONFIG = {
-    "scan_folders": [],
-    "ignore_patterns": [],
+    "active_library": "Default",
+    "libraries": [
+        {
+            "name": "Default",
+            "db": "media.db",
+            "scan_folders": [],
+            "ignore_patterns": [],
+        }
+    ],
     "ffprobe_path": "",
     "workers": 8,
 }
 
 
 def load_config():
-    """Load config from JSON file, merging with defaults."""
+    """Load config from JSON file, with migration from old flat format."""
     config = dict(DEFAULT_CONFIG)
+    config["libraries"] = [dict(lib) for lib in DEFAULT_CONFIG["libraries"]]
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r") as f:
                 saved = json.load(f)
+            # Migrate old flat format → library format
+            if "libraries" not in saved and "scan_folders" in saved:
+                saved["libraries"] = [{
+                    "name": "Default",
+                    "db": "media.db",
+                    "scan_folders": saved.pop("scan_folders", []),
+                    "ignore_patterns": saved.pop("ignore_patterns", []),
+                }]
+                saved["active_library"] = "Default"
             config.update(saved)
         except (json.JSONDecodeError, OSError):
             pass
@@ -45,6 +63,43 @@ def save_config(config):
     """Save config to JSON file."""
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
+
+
+def get_active_library(config=None):
+    """Return the active library dict from config."""
+    if config is None:
+        config = load_config()
+    name = config.get("active_library", "Default")
+    for lib in config.get("libraries", []):
+        if lib["name"] == name:
+            return lib
+    # Fallback to first library
+    libs = config.get("libraries", [])
+    return libs[0] if libs else {"name": "Default", "db": "media.db", "scan_folders": [], "ignore_patterns": []}
+
+
+def switch_library(name):
+    """Switch active library and update DB_PATH."""
+    global DB_PATH
+    config = load_config()
+    for lib in config.get("libraries", []):
+        if lib["name"] == name:
+            config["active_library"] = name
+            save_config(config)
+            db = lib.get("db", "media.db")
+            DB_PATH = os.path.join(CONFIG_DIR, db) if not os.path.isabs(db) else db
+            invalidate_all_caches()
+            return True
+    return False
+
+
+def invalidate_all_caches():
+    """Invalidate all server-side caches."""
+    invalidate_pbps_tiles_cache()
+    invalidate_distributions_cache()
+    invalidate_quality_cache()
+    invalidate_upgrade_cache()
+    invalidate_violin_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -93,18 +148,22 @@ def find_video_files_filtered(paths, ignore_patterns):
 
 
 def _load_existing_index():
-    """Load file_path → (file_mtime, file_size_bytes) from the live DB."""
+    """Load file_path → (file_mtime, file_size_bytes) from the live DB.
+    Returns (index_dict, has_timestamps_bool)."""
     index = {}
+    has_timestamps = False
     if not os.path.exists(DB_PATH):
-        return index
+        return index, False
     try:
         conn = get_db()
         for row in conn.execute("SELECT file_path, file_mtime, file_size_bytes FROM files"):
             index[row["file_path"]] = (row["file_mtime"], row["file_size_bytes"])
+            if row["file_mtime"] is not None:
+                has_timestamps = True
         conn.close()
     except Exception:
         pass
-    return index
+    return index, has_timestamps
 
 
 def _copy_file_rows(src_conn, dst_conn, filepath):
@@ -140,14 +199,15 @@ def run_scan():
     """Background scan: discover, probe new/changed files, copy unchanged, then swap."""
     try:
         config = load_config()
-        folders = config.get("scan_folders", [])
+        lib = get_active_library(config)
+        folders = lib.get("scan_folders", [])
         if not folders:
             with scan_lock:
                 scan_state.update(running=False, phase="error",
-                                  message="No scan folders configured")
+                                  message="No scan folders configured for library '" + lib["name"] + "'")
             return
 
-        ignore = config.get("ignore_patterns", [])
+        ignore = lib.get("ignore_patterns", [])
         ffprobe_cmd = config.get("ffprobe_path", "").strip() or "ffprobe"
         workers = config.get("workers", 8)
 
@@ -164,32 +224,38 @@ def run_scan():
             return
 
         # Phase: checking which files need probing
-        with scan_lock:
-            scan_state["phase"] = "checking"
-            scan_state["message"] = "Checking file timestamps..."
-
-        existing_index = _load_existing_index()
+        existing_index, has_timestamps = _load_existing_index()
         to_probe = []
         to_copy = []
-        for fp in video_files:
-            try:
-                st = os.stat(fp)
-                mtime = st.st_mtime
-                size = st.st_size
-            except OSError:
-                to_probe.append(fp)
-                continue
 
-            prev = existing_index.get(fp)
-            if prev and prev[0] is not None and prev[0] == mtime and prev[1] == size:
-                to_copy.append(fp)
-            else:
-                to_probe.append(fp)
+        if existing_index and has_timestamps:
+            with scan_lock:
+                scan_state["phase"] = "checking"
+                scan_state["message"] = "Checking file timestamps..."
+            for fp in video_files:
+                try:
+                    st = os.stat(fp)
+                    mtime = st.st_mtime
+                    size = st.st_size
+                except OSError:
+                    to_probe.append(fp)
+                    continue
+                prev = existing_index.get(fp)
+                if prev and prev[0] is not None and prev[0] == mtime and prev[1] == size:
+                    to_copy.append(fp)
+                else:
+                    to_probe.append(fp)
+        else:
+            # No timestamps in DB — skip stat checks, probe everything
+            to_probe = video_files
 
         with scan_lock:
             scan_state["total"] = len(video_files)
             scan_state["phase"] = "probing"
-            scan_state["message"] = (f"{len(to_copy)} unchanged, {len(to_probe)} to probe...")
+            msg = f"{len(to_copy)} unchanged, {len(to_probe)} to probe" if to_copy else f"{len(to_probe)} files to probe"
+            if not has_timestamps and existing_index:
+                msg += " (no cached timestamps — full re-probe)"
+            scan_state["message"] = msg
 
         # Create temp database
         db_dir = os.path.dirname(os.path.abspath(DB_PATH))
@@ -297,8 +363,7 @@ def run_scan():
                 except OSError:
                     pass
 
-        invalidate_pbps_tiles_cache()
-        invalidate_distributions_cache()
+        invalidate_all_caches()
         with scan_lock:
             scan_state.update(running=False, phase="done",
                               message=f"Scan complete: {done} files ({skipped} cached, {len(to_probe)} probed, {errors} errors)")
@@ -577,6 +642,276 @@ def invalidate_distributions_cache():
     _distributions_cache["data"] = None
 
 
+# ---------------------------------------------------------------------------
+# Quality Heatmap + Sankey cache
+# ---------------------------------------------------------------------------
+_quality_cache = {"data": None}
+
+
+def compute_quality_data():
+    conn = get_db()
+    try:
+        # Heatmap: avg ratio_vs_avg per codec x resolution
+        heatmap_rows = conn.execute("""
+            WITH bpp AS (
+                SELECT *,
+                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+                FROM v_video_summary
+                WHERE width > 0 AND height > 0 AND duration_seconds > 60
+            ),
+            avg_bpp AS (
+                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+                FROM bpp GROUP BY resolution_class
+            )
+            SELECT b.video_codec, b.resolution_class,
+                   ROUND(AVG(b.bpp_sec / a.avg_bpp_sec), 3) AS avg_ratio,
+                   COUNT(*) AS cnt
+            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+            WHERE b.duration_seconds / 60.0 > 10
+            GROUP BY b.video_codec, b.resolution_class
+        """).fetchall()
+
+        # Build heatmap matrix — codec order: oldest → newest
+        codec_order = ["msmpeg4v3", "mpeg4", "mpeg2video", "vc1", "h264", "hevc", "av1", "vvc"]
+        res_order = ["other", "480p", "720p", "1080p", "4K"]
+
+        matrix = {}
+        counts = {}
+        seen_codecs = set()
+        for r in heatmap_rows:
+            codec = r["video_codec"]
+            if codec not in codec_order:
+                codec = "other"
+            seen_codecs.add(codec)
+            res = r["resolution_class"]
+            key = (codec, res)
+            if key not in matrix:
+                matrix[key] = []
+                counts[key] = 0
+            matrix[key].append(r["avg_ratio"] * r["cnt"])
+            counts[key] += r["cnt"]
+
+        # Only include codecs that have data, in defined order
+        codecs_list = [c for c in codec_order if c in seen_codecs]
+        if "other" in seen_codecs:
+            codecs_list.insert(0, "other")
+
+        heatmap = {
+            "codecs": codecs_list,
+            "resolutions": res_order,
+            "values": [[round(sum(matrix.get((c, r), [0])) / max(counts.get((c, r), 1), 1), 3)
+                         if counts.get((c, r), 0) > 0 else None
+                         for r in res_order] for c in codecs_list],
+            "counts": [[counts.get((c, r), 0) for r in res_order] for c in codecs_list],
+        }
+
+        # Sankey: resolution → codec flow
+        sankey_rows = conn.execute("""
+            SELECT resolution_class, video_codec, COUNT(*) AS cnt
+            FROM v_video_summary
+            WHERE width > 0 AND height > 0 AND duration_seconds > 60
+              AND duration_seconds / 60.0 > 10
+            GROUP BY resolution_class, video_codec
+            ORDER BY cnt DESC
+        """).fetchall()
+
+        # Build sankey nodes and links
+        # Plotly renders first item at top, so reverse the desired bottom→top order
+        # Left (res): bottom→top = other,480p,720p,1080p,4K → list = [4K,1080p,720p,480p,other]
+        sankey_res_order = ["4K", "1080p", "720p", "480p", "other"]
+        # Right (codec): bottom→top = other,msmpeg4v3,mpeg4,h264,hevc,av1,vvc → list top→bottom:
+        sankey_codec_order = ["vvc", "av1", "hevc", "h264", "mpeg4", "msmpeg4v3", "other"]
+
+        codec_totals = {}
+        for r in sankey_rows:
+            codec_totals[r["video_codec"]] = codec_totals.get(r["video_codec"], 0) + r["cnt"]
+
+        # Only include codecs that exist in the data, in defined order
+        seen_sankey_codecs = set()
+        for r in sankey_rows:
+            if r["video_codec"] in sankey_codec_order:
+                seen_sankey_codecs.add(r["video_codec"])
+            else:
+                seen_sankey_codecs.add("other")
+        codec_nodes = [c for c in sankey_codec_order if c in seen_sankey_codecs]
+        res_nodes = sankey_res_order[:]
+
+        all_nodes = res_nodes + codec_nodes
+        node_idx = {n: i for i, n in enumerate(all_nodes)}
+
+        links_src, links_tgt, links_val = [], [], []
+        for r in sankey_rows:
+            res = r["resolution_class"]
+            codec = r["video_codec"] if r["video_codec"] in codec_nodes else "other"
+            if res in node_idx and codec in node_idx:
+                found = False
+                for i in range(len(links_src)):
+                    if links_src[i] == node_idx[res] and links_tgt[i] == node_idx[codec]:
+                        links_val[i] += r["cnt"]
+                        found = True
+                        break
+                if not found:
+                    links_src.append(node_idx[res])
+                    links_tgt.append(node_idx[codec])
+                    links_val.append(r["cnt"])
+
+        res_colors = {"4K": "#4ecca3", "1080p": "#5b8def", "720p": "#e0a030", "480p": "#e94560", "other": "#888"}
+        codec_colors = {"vvc": "#00e5ff", "av1": "#5b8def", "hevc": "#4ecca3", "h264": "#e94560",
+                        "vc1": "#533483", "mpeg2video": "#e0a030", "mpeg4": "#c97030", "msmpeg4v3": "#885030",
+                        "other": "#888"}
+        node_colors = [res_colors.get(n, "#888") for n in res_nodes] + \
+                      [codec_colors.get(n, "#888") for n in codec_nodes]
+
+        sankey = {
+            "nodes": all_nodes,
+            "node_colors": node_colors,
+            "links_src": links_src,
+            "links_tgt": links_tgt,
+            "links_val": links_val,
+        }
+
+        return {"heatmap": heatmap, "sankey": sankey}
+    finally:
+        conn.close()
+
+
+def get_quality_data():
+    if _quality_cache["data"] is None:
+        _quality_cache["data"] = compute_quality_data()
+    return _quality_cache["data"]
+
+
+def invalidate_quality_cache():
+    _quality_cache["data"] = None
+
+
+# ---------------------------------------------------------------------------
+# Upgrade Priority List
+# ---------------------------------------------------------------------------
+_upgrade_cache = {"data": None}
+
+UPGRADE_SQL = """
+WITH bpp AS (
+    SELECT *,
+           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+      AND duration_seconds / 60.0 > 10
+),
+avg_bpp AS (
+    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+    FROM bpp GROUP BY resolution_class
+),
+scored AS (
+    SELECT b.file_name, b.file_path, b.video_codec, b.resolution_class,
+           b.width, b.height,
+           ROUND(b.bpp_sec / a.avg_bpp_sec, 3) AS ratio_vs_avg,
+           ROUND(b.file_size_bytes / 1048576.0, 1) AS size_mb,
+           ROUND(b.duration_seconds / 60.0, 1) AS dur_min,
+           b.file_size_bytes,
+           -- Score components (higher = more urgent upgrade)
+           CASE WHEN b.video_codec = 'h264' THEN 3
+                WHEN b.video_codec = 'mpeg2video' THEN 5
+                WHEN b.video_codec = 'vc1' THEN 4
+                WHEN b.video_codec = 'msmpeg4v3' THEN 5
+                ELSE 0 END AS codec_penalty,
+           CASE WHEN b.resolution_class = '480p' THEN 4
+                WHEN b.resolution_class = 'other' THEN 5
+                WHEN b.resolution_class = '720p' THEN 2
+                ELSE 0 END AS res_penalty,
+           CASE WHEN b.bpp_sec / a.avg_bpp_sec > 2.0 THEN 3
+                WHEN b.bpp_sec / a.avg_bpp_sec > 1.5 THEN 2
+                WHEN b.bpp_sec / a.avg_bpp_sec < 0.3 THEN 3
+                WHEN b.bpp_sec / a.avg_bpp_sec < 0.5 THEN 1
+                ELSE 0 END AS ratio_penalty
+    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+)
+SELECT file_name, file_path, video_codec, resolution_class,
+       width || 'x' || height AS resolution,
+       ratio_vs_avg, size_mb, dur_min,
+       codec_penalty + res_penalty + ratio_penalty AS upgrade_score,
+       CASE WHEN codec_penalty > 0 THEN 'old codec' ELSE '' END ||
+       CASE WHEN res_penalty > 0 THEN ' low res' ELSE '' END ||
+       CASE WHEN ratio_penalty > 0 THEN ' bad ratio' ELSE '' END AS reasons
+FROM scored
+WHERE codec_penalty + res_penalty + ratio_penalty > 0
+ORDER BY codec_penalty + res_penalty + ratio_penalty DESC,
+         file_size_bytes DESC
+"""
+
+
+def compute_upgrade_list():
+    conn = get_db()
+    try:
+        cursor = conn.execute(UPGRADE_SQL)
+        columns = [d[0] for d in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchmany(5000)]
+        return {"columns": columns, "rows": rows, "total": len(rows)}
+    finally:
+        conn.close()
+
+
+def get_upgrade_list():
+    if _upgrade_cache["data"] is None:
+        _upgrade_cache["data"] = compute_upgrade_list()
+    return _upgrade_cache["data"]
+
+
+def invalidate_upgrade_cache():
+    _upgrade_cache["data"] = None
+
+
+# ---------------------------------------------------------------------------
+# Violin plot data (ratio_vs_avg values per resolution class)
+# ---------------------------------------------------------------------------
+_violin_cache = {"data": None}
+
+
+def compute_violin_data():
+    conn = get_db()
+    try:
+        rows = conn.execute("""
+            WITH bpp AS (
+                SELECT *,
+                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+                FROM v_video_summary
+                WHERE width > 0 AND height > 0 AND duration_seconds > 60
+            ),
+            avg_bpp AS (
+                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+                FROM bpp GROUP BY resolution_class
+            )
+            SELECT b.resolution_class,
+                   ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio
+            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+            WHERE b.duration_seconds / 60.0 > 10
+              AND b.bpp_sec / a.avg_bpp_sec < 5.0
+        """).fetchall()
+
+        # Group by resolution
+        data = {}
+        for r in rows:
+            res = r["resolution_class"]
+            if res not in data:
+                data[res] = []
+            data[res].append(r["ratio"])
+
+        res_order = ["4K", "1080p", "720p", "480p", "other"]
+        return [{"name": r, "values": data.get(r, [])} for r in res_order if r in data]
+    finally:
+        conn.close()
+
+
+def get_violin_data():
+    if _violin_cache["data"] is None:
+        _violin_cache["data"] = compute_violin_data()
+    return _violin_cache["data"]
+
+
+def invalidate_violin_cache():
+    _violin_cache["data"] = None
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default access logs
@@ -614,12 +949,20 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_query(params)
         elif path == "/api/config":
             self.handle_get_config()
+        elif path == "/api/libraries":
+            self.handle_get_libraries()
         elif path == "/api/scan/status":
             self.handle_scan_status()
         elif path == "/api/pbps/tiles":
             self.handle_pbps_tiles()
         elif path == "/api/distributions":
             self.handle_distributions()
+        elif path == "/api/quality":
+            self.handle_quality()
+        elif path == "/api/upgrades":
+            self.handle_upgrades()
+        elif path == "/api/violins":
+            self.handle_violins()
         else:
             self.send_response(404)
             self.end_headers()
@@ -630,6 +973,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if path == "/api/config":
             self.handle_post_config()
+        elif path == "/api/libraries/switch":
+            self.handle_switch_library()
         elif path == "/api/scan/start":
             self.handle_scan_start()
         else:
@@ -639,6 +984,26 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_get_config(self):
         self.send_json(load_config())
 
+    def handle_get_libraries(self):
+        config = load_config()
+        self.send_json({
+            "active": config.get("active_library", "Default"),
+            "libraries": [lib["name"] for lib in config.get("libraries", [])],
+        })
+
+    def handle_switch_library(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": "Invalid JSON"}, 400)
+            return
+        name = body.get("name", "")
+        if switch_library(name):
+            self.send_json({"ok": True, "active": name, "db": DB_PATH})
+        else:
+            self.send_json({"error": f"Library '{name}' not found"}, 404)
+
     def handle_post_config(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -647,15 +1012,30 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Invalid JSON"}, 400)
             return
         config = load_config()
-        if "scan_folders" in body and isinstance(body["scan_folders"], list):
-            config["scan_folders"] = [str(p) for p in body["scan_folders"]]
-        if "ignore_patterns" in body and isinstance(body["ignore_patterns"], list):
-            config["ignore_patterns"] = [str(p) for p in body["ignore_patterns"]]
+        # Global settings
         if "ffprobe_path" in body:
             config["ffprobe_path"] = str(body["ffprobe_path"])
         if "workers" in body:
             config["workers"] = max(1, min(32, int(body["workers"])))
+        # Libraries array (full replacement)
+        if "libraries" in body and isinstance(body["libraries"], list):
+            config["libraries"] = []
+            for lib in body["libraries"]:
+                config["libraries"].append({
+                    "name": str(lib.get("name", "Unnamed")),
+                    "db": str(lib.get("db", "media.db")),
+                    "scan_folders": [str(p) for p in lib.get("scan_folders", [])],
+                    "ignore_patterns": [str(p) for p in lib.get("ignore_patterns", [])],
+                })
+            # Ensure active library still exists
+            names = [l["name"] for l in config["libraries"]]
+            if config.get("active_library") not in names and names:
+                config["active_library"] = names[0]
+        if "active_library" in body:
+            config["active_library"] = str(body["active_library"])
         save_config(config)
+        # Re-apply active library DB path
+        switch_library(config.get("active_library", "Default"))
         self.send_json({"ok": True})
 
     def handle_scan_status(self):
@@ -671,6 +1051,24 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_distributions(self):
         try:
             self.send_json(get_distributions())
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_quality(self):
+        try:
+            self.send_json(get_quality_data())
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_upgrades(self):
+        try:
+            self.send_json(get_upgrade_list())
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
+
+    def handle_violins(self):
+        try:
+            self.send_json(get_violin_data())
         except Exception as e:
             self.send_json({"error": str(e)}, 500)
 
@@ -1011,6 +1409,7 @@ td.clickable-path:hover { color: var(--green); }
 <div class="header-row">
     <h1>Media Stats Viewer</h1>
     <div class="header-actions">
+        <select id="librarySwitcher" onchange="switchLibrary(this.value)" title="Switch library" style="font-size:0.85em"></select>
         <button class="icon-btn" id="scanBtn" onclick="startScan()" title="Start scan">&#9654;</button>
         <button class="icon-btn" id="settingsBtn" onclick="openSettings()" title="Settings">&#9881;</button>
     </div>
@@ -1022,6 +1421,8 @@ td.clickable-path:hover { color: var(--green); }
     <div class="tab" data-section="chart-section">Charts</div>
     <div class="tab" data-section="pbps-section">Normalized PBPS</div>
     <div class="tab" data-section="dist-section">Distributions</div>
+    <div class="tab" data-section="quality-section">Quality Map</div>
+    <div class="tab" data-section="upgrade-section">Upgrades</div>
     <div class="tab" data-section="sql-section">SQL Console</div>
 </div>
 
@@ -1124,10 +1525,35 @@ td.clickable-path:hover { color: var(--green); }
     <p class="info">Ratio vs Average distribution broken down by codec and resolution. Bars show file counts in 0.1-wide ratio buckets (0.4–1.6). Vertical line marks 1.0 (average).</p>
     <button onclick="loadDistributions()">Load Charts</button>
     <span id="distInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    <h2>Bitrate Distribution (Violin Plots)</h2>
+    <div id="distViolinChart" style="min-height:400px"></div>
     <h2>By Video Codec</h2>
     <div id="distCodecChart" style="min-height:400px"></div>
     <h2>By Resolution</h2>
     <div id="distResChart" style="min-height:400px"></div>
+</div>
+</div>
+
+<!-- QUALITY MAP -->
+<div class="section" id="quality-section">
+<div class="panel">
+    <p class="info">Quality heatmap shows average ratio vs average per codec/resolution combination. Sankey diagram shows file flow from resolution to codec.</p>
+    <button onclick="loadQualityMap()">Load Charts</button>
+    <span id="qualityInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    <h2>Quality Heatmap (Codec x Resolution)</h2>
+    <div id="qualityHeatmap" style="min-height:450px"></div>
+    <h2>Resolution &rarr; Codec Flow</h2>
+    <div id="qualitySankey" style="min-height:500px"></div>
+</div>
+</div>
+
+<!-- UPGRADES -->
+<div class="section" id="upgrade-section">
+<div class="panel">
+    <p class="info">Files scored by upgrade urgency: old codecs (h264, mpeg2, vc1), low resolution (&le;720p), and abnormal bitrate ratios. Higher score = more urgent.</p>
+    <button onclick="loadUpgrades()">Load List</button>
+    <span id="upgradeInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    <div class="table-wrap" id="upgradeTableWrap" style="margin-top:12px"></div>
 </div>
 </div>
 
@@ -1148,28 +1574,43 @@ td.clickable-path:hover { color: var(--green); }
 
 <!-- SETTINGS MODAL -->
 <div class="settings-overlay" id="settingsOverlay" onclick="if(event.target===this)closeSettings()">
-<div class="settings-panel">
+<div class="settings-panel" style="width:640px">
     <h2 style="color:var(--green);margin-top:0">Settings</h2>
 
-    <h3>Target Folders</h3>
-    <div class="list-items" id="folderList"></div>
-    <div class="add-row">
-        <input type="text" id="newFolder" placeholder="/path/to/media/folder">
-        <button onclick="addListItem('folder')">Add</button>
+    <h3>Libraries</h3>
+    <div class="controls" style="margin-bottom:8px">
+        <select id="settingsLibSelect" onchange="switchSettingsLib()" style="flex:1"></select>
+        <button class="btn-sm" onclick="addLibrary()">+ New</button>
+        <button class="btn-sm" onclick="removeLibrary()" style="background:var(--accent)">Remove</button>
     </div>
 
-    <h3>Ignore Patterns</h3>
-    <p style="color:var(--text2);font-size:0.78em;margin-bottom:4px">Directory names containing these strings will be skipped during scanning</p>
-    <div class="list-items" id="patternList"></div>
-    <div class="add-row">
-        <input type="text" id="newPattern" placeholder="e.g. sample, mature, .recycle">
-        <button onclick="addListItem('pattern')">Add</button>
+    <div style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-bottom:12px">
+        <label style="font-size:0.8em;color:var(--text2)">Library Name</label>
+        <input type="text" id="libName" style="width:100%;margin-bottom:8px">
+
+        <label style="font-size:0.8em;color:var(--text2)">Database File</label>
+        <input type="text" id="libDB" placeholder="media.db" style="width:100%;margin-bottom:8px">
+
+        <label style="font-size:0.8em;color:var(--text2)">Target Folders</label>
+        <div class="list-items" id="folderList"></div>
+        <div class="add-row" style="margin-bottom:8px">
+            <input type="text" id="newFolder" placeholder="/path/to/media/folder">
+            <button onclick="addListItem('folder')">Add</button>
+        </div>
+
+        <label style="font-size:0.8em;color:var(--text2)">Ignore Patterns</label>
+        <div class="list-items" id="patternList"></div>
+        <div class="add-row">
+            <input type="text" id="newPattern" placeholder="e.g. sample, mature, .recycle">
+            <button onclick="addListItem('pattern')">Add</button>
+        </div>
     </div>
 
-    <h3>ffprobe Path</h3>
-    <input type="text" id="ffprobePath" placeholder="(uses system PATH)" style="width:100%">
+    <h3>Global Settings</h3>
+    <label style="font-size:0.8em;color:var(--text2)">ffprobe Path</label>
+    <input type="text" id="ffprobePath" placeholder="(uses system PATH)" style="width:100%;margin-bottom:8px">
 
-    <h3>Parallel Workers</h3>
+    <label style="font-size:0.8em;color:var(--text2)">Parallel Workers</label>
     <input type="number" id="workerCount" min="1" max="32" value="8" style="width:80px">
 
     <div class="actions">
@@ -1224,6 +1665,7 @@ async function init() {
     loadStatsColumns();
     loadChartColumns();
     loadPBPSTiles();
+    loadLibraries();
 }
 
 // Data browser
@@ -1305,7 +1747,7 @@ function sortTableCol(wrapId, col) {
 }
 
 // Click handlers for file_name (geekseek) and file_path (copy to clipboard)
-document.getElementById('pbpsTableWrap').addEventListener('click', function(e) {
+function handleTableClick(e) {
     const td = e.target.closest('td');
     if (!td) return;
     const col = td.dataset.col;
@@ -1313,22 +1755,18 @@ document.getElementById('pbpsTableWrap').addEventListener('click', function(e) {
     if (!tr) return;
 
     if (col === 'file_name') {
-        // Get file_path from the same row to determine Movie vs TV
         const pathTd = tr.querySelector('td[data-col="file_path"]');
         const filePath = pathTd ? pathTd.title : '';
         const isTV = /\\TV\\/i.test(filePath) || /\/TV\//i.test(filePath);
         const category = isTV ? '5000' : '2000';
-
-        // Clean filename: strip extension, replace dots/underscores with spaces
         let name = td.title || '';
-        name = name.replace(/\.[^.]+$/, '');           // strip extension
-        name = name.replace(/\{[^}]*\}/g, '');          // strip {edition-Criterion} etc.
-        name = name.replace(/[._]/g, ' ');              // dots/underscores → spaces
-        name = name.replace(/\s*S\d{1,2}E\d{1,2}.*/i, ''); // strip S01E02... for TV
-        name = name.replace(/\s*(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|aac|bluray|bdrip|webrip|web-dl|hdtv|remux|dts|atmos)\b.*/i, ''); // strip quality tags
-        name = name.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/, ''); // strip trailing (2023) or [2023]
+        name = name.replace(/\.[^.]+$/, '');
+        name = name.replace(/\{[^}]*\}/g, '');
+        name = name.replace(/[._]/g, ' ');
+        name = name.replace(/\s*S\d{1,2}E\d{1,2}.*/i, '');
+        name = name.replace(/\s*(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|aac|bluray|bdrip|webrip|web-dl|hdtv|remux|dts|atmos)\b.*/i, '');
+        name = name.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/, '');
         name = name.trim();
-
         const url = `https://nzbgeek.info/geekseek.php?moviesgeekseek=1&c=${category}&browseincludewords=${encodeURIComponent(name)}`;
         window.open(url, '_blank');
     }
@@ -1340,7 +1778,9 @@ document.getElementById('pbpsTableWrap').addEventListener('click', function(e) {
             setTimeout(() => td.classList.remove('copied-flash'), 600);
         });
     }
-});
+}
+document.getElementById('pbpsTableWrap').addEventListener('click', handleTableClick);
+document.getElementById('upgradeTableWrap').addEventListener('click', handleTableClick);
 
 function sortBy(col) {
     if (currentSort === col) currentDir = currentDir === 'asc' ? 'desc' : 'asc';
@@ -1669,11 +2109,132 @@ async function loadDistributions(force) {
     }));
     Plotly.newPlot('distResChart', resTraces, {...darkLayout, xaxis: {...darkLayout.xaxis, title: 'Ratio vs Average (by Resolution)'}}, { responsive: true });
 
+    // Violin plots
+    const vResp = await fetch('/api/violins');
+    const vData = await vResp.json();
+    const violinColors = { '4K': '#4ecca3', '1080p': '#5b8def', '720p': '#e0a030', '480p': '#e94560', 'other': '#888' };
+    const violinTraces = vData.map(s => ({
+        type: 'violin', y: s.values, name: s.name,
+        box: { visible: true }, meanline: { visible: true },
+        marker: { color: violinColors[s.name] || '#888' },
+        line: { color: violinColors[s.name] || '#888' },
+    }));
+    Plotly.newPlot('distViolinChart', violinTraces, {
+        ...darkLayout,
+        xaxis: { ...darkLayout.xaxis, title: 'Resolution Class' },
+        yaxis: { ...darkLayout.yaxis, title: 'Ratio vs Average' },
+        shapes: [{ type: 'line', x0: -0.5, x1: vData.length - 0.5, y0: 1, y1: 1,
+                   line: { color: '#e0e0e0', width: 1, dash: 'dash' } }],
+    }, { responsive: true });
+
     document.getElementById('distInfo').textContent = '';
     distLoaded = true;
 }
 
-// Settings panel
+// Quality Map (Heatmap + Sankey)
+let qualityLoaded = false;
+
+async function loadQualityMap(force) {
+    if (qualityLoaded && !force) { document.getElementById('qualityInfo').textContent = '(cached)'; return; }
+    document.getElementById('qualityInfo').textContent = 'Loading...';
+    const resp = await fetch('/api/quality');
+    const q = await resp.json();
+    if (q.error) { document.getElementById('qualityInfo').textContent = 'Error: ' + q.error; return; }
+
+    const darkLayout = {
+        paper_bgcolor: '#1a1a2e', plot_bgcolor: '#16213e',
+        font: { color: '#e0e0e0' }, margin: { t: 30, r: 20 },
+    };
+
+    // Heatmap — green at 1.0, yellow/orange/red toward extremes, blank for zero files
+    const hm = q.heatmap;
+    const hoverText = hm.codecs.map((c, ci) =>
+        hm.resolutions.map((r, ri) => hm.values[ci][ri] != null
+            ? `${c} / ${r}<br>Avg ratio: ${hm.values[ci][ri]}<br>Files: ${hm.counts[ci][ri]}`
+            : `${c} / ${r}<br>No files`)
+    );
+    Plotly.newPlot('qualityHeatmap', [{
+        type: 'heatmap',
+        z: hm.values, x: hm.resolutions, y: hm.codecs,
+        text: hoverText, hoverinfo: 'text',
+        colorscale: [
+            [0, '#e94560'],     // far below avg — red
+            [0.25, '#e0a030'],  // below avg — orange
+            [0.5, '#4ecca3'],   // at 1.0 — green (ideal)
+            [0.75, '#e0a030'],  // above avg — orange
+            [1, '#e94560'],     // far above avg — red
+        ],
+        zmid: 1.0,
+        zmin: 0.3,
+        zmax: 1.7,
+        connectgaps: false,
+        colorbar: { title: 'Ratio', tickvals: [0.5, 0.75, 1.0, 1.25, 1.5] },
+    }], {
+        ...darkLayout,
+        xaxis: { title: 'Resolution', color: '#e0e0e0' },
+        yaxis: { title: 'Codec (oldest → newest)', color: '#e0e0e0' },
+        margin: { t: 30, r: 100, l: 120 },
+    }, { responsive: true });
+
+    // Sankey
+    const sk = q.sankey;
+    Plotly.newPlot('qualitySankey', [{
+        type: 'sankey',
+        orientation: 'h',
+        node: {
+            label: sk.nodes,
+            color: sk.node_colors,
+            pad: 15, thickness: 20,
+            line: { color: '#0f3460', width: 1 },
+        },
+        link: {
+            source: sk.links_src,
+            target: sk.links_tgt,
+            value: sk.links_val,
+            color: 'rgba(78, 204, 163, 0.15)',
+        },
+    }], {
+        ...darkLayout,
+        margin: { t: 20, r: 20, b: 20, l: 20 },
+    }, { responsive: true });
+
+    document.getElementById('qualityInfo').textContent = '';
+    qualityLoaded = true;
+}
+
+// Upgrade Priority List
+let upgradeLoaded = false;
+
+async function loadUpgrades(force) {
+    if (upgradeLoaded && !force) { document.getElementById('upgradeInfo').textContent = '(cached)'; return; }
+    document.getElementById('upgradeInfo').textContent = 'Loading...';
+    const resp = await fetch('/api/upgrades');
+    const data = await resp.json();
+    if (data.error) { document.getElementById('upgradeInfo').textContent = 'Error: ' + data.error; return; }
+    document.getElementById('upgradeInfo').textContent = `${data.total} files need attention`;
+    renderSortableTable('upgradeTableWrap', data.columns, data.rows);
+    upgradeLoaded = true;
+}
+
+// Settings panel — multi-library
+let settingsConfig = null;
+let settingsPrevLibIdx = 0;
+
+function switchSettingsLib() {
+    // Save fields for the previous library before switching
+    const prevIdx = settingsPrevLibIdx;
+    const sel = document.getElementById('settingsLibSelect');
+    const newIdx = parseInt(sel.value);
+    if (settingsConfig.libraries[prevIdx]) {
+        settingsConfig.libraries[prevIdx].name = document.getElementById('libName').value.trim() || 'Unnamed';
+        settingsConfig.libraries[prevIdx].db = document.getElementById('libDB').value.trim() || 'media.db';
+        settingsConfig.libraries[prevIdx].scan_folders = JSON.parse(document.getElementById('folderList').dataset.items || '[]');
+        settingsConfig.libraries[prevIdx].ignore_patterns = JSON.parse(document.getElementById('patternList').dataset.items || '[]');
+    }
+    settingsPrevLibIdx = newIdx;
+    loadLibraryFields();
+}
+
 async function openSettings() {
     await loadSettings();
     document.getElementById('settingsOverlay').classList.add('open');
@@ -1685,11 +2246,60 @@ function closeSettings() {
 
 async function loadSettings() {
     const resp = await fetch('/api/config');
-    const cfg = await resp.json();
-    renderList('folder', cfg.scan_folders || []);
-    renderList('pattern', cfg.ignore_patterns || []);
-    document.getElementById('ffprobePath').value = cfg.ffprobe_path || '';
-    document.getElementById('workerCount').value = cfg.workers || 8;
+    settingsConfig = await resp.json();
+    const sel = document.getElementById('settingsLibSelect');
+    const libs = settingsConfig.libraries || [];
+    sel.innerHTML = libs.map((l, i) => `<option value="${i}">${escHtml(l.name)}</option>`).join('');
+    // Select the active library
+    const activeIdx = libs.findIndex(l => l.name === settingsConfig.active_library);
+    if (activeIdx >= 0) sel.value = activeIdx;
+    loadLibraryFields();
+    document.getElementById('ffprobePath').value = settingsConfig.ffprobe_path || '';
+    document.getElementById('workerCount').value = settingsConfig.workers || 8;
+}
+
+function loadLibraryFields() {
+    const idx = parseInt(document.getElementById('settingsLibSelect').value);
+    settingsPrevLibIdx = idx;
+    const libs = settingsConfig.libraries || [];
+    const lib = libs[idx] || { name: '', db: '', scan_folders: [], ignore_patterns: [] };
+    document.getElementById('libName').value = lib.name || '';
+    document.getElementById('libDB').value = lib.db || '';
+    renderList('folder', lib.scan_folders || []);
+    renderList('pattern', lib.ignore_patterns || []);
+}
+
+function saveLibraryFields() {
+    const idx = parseInt(document.getElementById('settingsLibSelect').value);
+    if (!settingsConfig.libraries[idx]) return;
+    settingsConfig.libraries[idx].name = document.getElementById('libName').value.trim() || 'Unnamed';
+    settingsConfig.libraries[idx].db = document.getElementById('libDB').value.trim() || 'media.db';
+    settingsConfig.libraries[idx].scan_folders = JSON.parse(document.getElementById('folderList').dataset.items || '[]');
+    settingsConfig.libraries[idx].ignore_patterns = JSON.parse(document.getElementById('patternList').dataset.items || '[]');
+}
+
+function addLibrary() {
+    saveLibraryFields();
+    const name = prompt('Library name:');
+    if (!name) return;
+    const db = prompt('Database filename:', name.toLowerCase().replace(/\s+/g, '_') + '.db');
+    if (!db) return;
+    settingsConfig.libraries.push({ name, db, scan_folders: [], ignore_patterns: [] });
+    const sel = document.getElementById('settingsLibSelect');
+    sel.innerHTML = settingsConfig.libraries.map((l, i) => `<option value="${i}">${escHtml(l.name)}</option>`).join('');
+    sel.value = settingsConfig.libraries.length - 1;
+    loadLibraryFields();
+}
+
+function removeLibrary() {
+    const idx = parseInt(document.getElementById('settingsLibSelect').value);
+    if (settingsConfig.libraries.length <= 1) { alert('Cannot remove the last library'); return; }
+    if (!confirm(`Remove library "${settingsConfig.libraries[idx].name}"?`)) return;
+    settingsConfig.libraries.splice(idx, 1);
+    const sel = document.getElementById('settingsLibSelect');
+    sel.innerHTML = settingsConfig.libraries.map((l, i) => `<option value="${i}">${escHtml(l.name)}</option>`).join('');
+    sel.value = 0;
+    loadLibraryFields();
 }
 
 function renderList(type, items) {
@@ -1720,11 +2330,10 @@ function removeListItem(type, idx) {
 }
 
 async function saveSettings() {
-    const folders = JSON.parse(document.getElementById('folderList').dataset.items || '[]');
-    const patterns = JSON.parse(document.getElementById('patternList').dataset.items || '[]');
+    saveLibraryFields();
     const config = {
-        scan_folders: folders,
-        ignore_patterns: patterns,
+        libraries: settingsConfig.libraries,
+        active_library: settingsConfig.active_library,
         ffprobe_path: document.getElementById('ffprobePath').value.trim(),
         workers: parseInt(document.getElementById('workerCount').value) || 8,
     };
@@ -1734,8 +2343,42 @@ async function saveSettings() {
         body: JSON.stringify(config),
     });
     const result = await resp.json();
-    if (result.ok) closeSettings();
-    else alert('Error saving: ' + (result.error || 'unknown'));
+    if (result.ok) {
+        closeSettings();
+        loadLibraries();
+    } else {
+        alert('Error saving: ' + (result.error || 'unknown'));
+    }
+}
+
+// Library switcher
+async function loadLibraries() {
+    const resp = await fetch('/api/libraries');
+    const data = await resp.json();
+    const sel = document.getElementById('librarySwitcher');
+    sel.innerHTML = data.libraries.map(name =>
+        `<option value="${escHtml(name)}"${name === data.active ? ' selected' : ''}>${escHtml(name)}</option>`
+    ).join('');
+}
+
+async function switchLibrary(name) {
+    const resp = await fetch('/api/libraries/switch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ name }),
+    });
+    const result = await resp.json();
+    if (result.ok) {
+        // Refresh everything
+        pbpsTilesLoaded = false;
+        distLoaded = false;
+        qualityLoaded = false;
+        upgradeLoaded = false;
+        loadPBPSTiles(true);
+        loadData();
+    } else {
+        alert(result.error || 'Switch failed');
+    }
 }
 
 // Scan
@@ -1797,7 +2440,9 @@ async function pollScanStatus() {
                 bar.style.width = '100%';
                 loadData();  // refresh current view
                 loadPBPSTiles(true);  // refresh tiles (force, cache invalidated server-side)
-                distLoaded = false;  // invalidate distributions client cache
+                distLoaded = false;  // invalidate client caches
+                qualityLoaded = false;
+                upgradeLoaded = false;
             }
         }
     } catch (e) {
@@ -1818,16 +2463,20 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
     args = parser.parse_args()
 
-    global DB_PATH, CONFIG_PATH
-    DB_PATH = args.db
-    CONFIG_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(DB_PATH)),
-        "media_analyser_config.json",
-    )
+    global DB_PATH, CONFIG_PATH, CONFIG_DIR
+    CONFIG_DIR = os.path.dirname(os.path.abspath(args.db))
+    CONFIG_PATH = os.path.join(CONFIG_DIR, "media_analyser_config.json")
+
+    # Load config and set active library's DB (or fall back to CLI arg)
+    config = load_config()
+    lib = get_active_library(config)
+    db = lib.get("db", args.db)
+    DB_PATH = os.path.join(CONFIG_DIR, db) if not os.path.isabs(db) else db
 
     if not os.path.exists(DB_PATH):
-        print(f"Database not found: {DB_PATH}")
-        return
+        print(f"Database not found: {DB_PATH} (library: {lib['name']})")
+        print("Start a scan from the web UI to create it.")
+        # Don't exit — allow the server to start so the user can configure and scan
 
     # Set console window title on Windows
     if os.name == "nt":
