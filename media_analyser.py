@@ -3,7 +3,7 @@
 Interactive web-based media stats viewer.
 
 Usage:
-    python web_viewer.py [--db media.db] [--port 8080]
+    python media_analyser.py [--db media.db] [--port 8080]
 """
 
 import argparse

@@ -7,7 +7,7 @@ A Python-based media file analyser that indexes video metadata from NAS/local st
 - **Single-file scripts** — no framework, no external web dependencies beyond Plotly CDN
 - **`index_media.py`** — CLI tool that walks directories, runs `ffprobe` per file via `subprocess.run()`, stores results in SQLite. Uses `ThreadPoolExecutor` (8 workers default) with `tqdm` progress. Supports `--resume` to skip already-indexed files.
 - **`analyse_media.py`** — CLI analysis tool with commands: summary, codec-stats, resolution, codecs, largest, smallest, sql, audio, subtitles
-- **`web_viewer.py`** — Self-contained web app: Python `HTTPServer` backend + embedded HTML/CSS/JS frontend. Dark-themed tab UI (Data Browser, Statistics, Charts, Normalized PBPS, SQL Console). All API communication via `fetch()` GET requests to `/api/*` endpoints.
+- **`media_analyser.py`** — Self-contained web app: Python `HTTPServer` backend + embedded HTML/CSS/JS frontend. Dark-themed tab UI (Data Browser, Statistics, Charts, Normalized PBPS, SQL Console). All API communication via `fetch()` GET requests to `/api/*` endpoints.
 
 ## Database
 - **SQLite with WAL mode** for concurrent read access
@@ -23,7 +23,7 @@ A Python-based media file analyser that indexes video metadata from NAS/local st
 - tqdm for CLI progress bars
 
 ## Key Patterns
-- The web frontend is a single `INDEX_HTML` raw string embedded in `web_viewer.py`
+- The web frontend is a single `INDEX_HTML` raw string embedded in `media_analyser.py`
 - API endpoints are routed in `do_GET()` via path matching
 - All SQL queries use parameterized values or view whitelisting to prevent injection
 - `get_db()` creates a fresh connection per request (no connection pooling)
@@ -39,5 +39,5 @@ A Python-based media file analyser that indexes video metadata from NAS/local st
 ```bash
 python index_media.py --db media.db --resume /path/to/videos
 python analyse_media.py --db media.db --all
-python web_viewer.py --db media.db --port 8081
+python media_analyser.py --db media.db --port 8081
 ```
