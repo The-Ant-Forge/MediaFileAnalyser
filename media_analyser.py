@@ -88,6 +88,7 @@ def switch_library(name):
             save_config(config)
             db = lib.get("db", "media.db")
             DB_PATH = os.path.join(CONFIG_DIR, db) if not os.path.isabs(db) else db
+            refresh_views()
             invalidate_all_caches()
             return True
     return False
@@ -364,6 +365,7 @@ def run_scan():
                     pass
 
         invalidate_all_caches()
+        capture_snapshot()
         with scan_lock:
             scan_state.update(running=False, phase="done",
                               message=f"Scan complete: {done} files ({skipped} cached, {len(to_probe)} probed, {errors} errors)")
@@ -379,6 +381,21 @@ def get_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def refresh_views():
+    """Recreate views on the live DB to pick up threshold changes."""
+    if not os.path.exists(DB_PATH):
+        return
+    try:
+        conn = get_db()
+        for view in ["v_video_summary", "v_audio_summary", "v_subtitle_summary"]:
+            conn.execute(f"DROP VIEW IF EXISTS [{view}]")
+        from index_media import DB_SCHEMA
+        conn.executescript(DB_SCHEMA)
+        conn.close()
+    except Exception:
+        pass
 
 
 def dict_rows(cursor):
@@ -912,6 +929,114 @@ def invalidate_violin_cache():
     _violin_cache["data"] = None
 
 
+# ---------------------------------------------------------------------------
+# Scan snapshots — track library health over time
+# ---------------------------------------------------------------------------
+SNAPSHOT_SQL = """
+WITH bpp AS (
+    SELECT *,
+           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+),
+avg_bpp AS (
+    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+    FROM bpp GROUP BY resolution_class
+),
+joined AS (
+    SELECT b.bpp_sec, b.bpp_sec / a.avg_bpp_sec AS ratio_vs_avg,
+           b.video_codec, b.resolution_class,
+           b.file_size_bytes, b.duration_seconds
+    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+    WHERE b.duration_seconds / 60.0 > 10
+)
+SELECT
+    COUNT(*) AS total_files,
+    ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_size_gb,
+    SUM(CASE WHEN video_codec = 'h264' THEN 1 ELSE 0 END) AS h264_count,
+    SUM(CASE WHEN video_codec = 'hevc' THEN 1 ELSE 0 END) AS hevc_count,
+    SUM(CASE WHEN video_codec = 'av1' THEN 1 ELSE 0 END) AS av1_count,
+    SUM(CASE WHEN resolution_class = '4K' THEN 1 ELSE 0 END) AS res_4k,
+    SUM(CASE WHEN resolution_class = '1080p' THEN 1 ELSE 0 END) AS res_1080p,
+    SUM(CASE WHEN resolution_class = '720p' THEN 1 ELSE 0 END) AS res_720p,
+    SUM(CASE WHEN resolution_class = '480p' THEN 1 ELSE 0 END) AS res_480p,
+    SUM(CASE WHEN resolution_class = 'other' THEN 1 ELSE 0 END) AS res_other,
+    SUM(CASE WHEN ratio_vs_avg > 1.5 THEN 1 ELSE 0 END) AS rva_up_count,
+    SUM(CASE WHEN ratio_vs_avg < 0.5 THEN 1 ELSE 0 END) AS rva_down_count,
+    ROUND(AVG(bpp_sec), 6) AS mean_bpp_sec
+FROM joined
+"""
+
+SNAPSHOT_MEDIAN_SQL = """
+WITH bpp AS (
+    SELECT file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec,
+           duration_seconds
+    FROM v_video_summary
+    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+)
+SELECT ROUND(bpp_sec, 6) AS median_bpp_sec
+FROM bpp WHERE duration_seconds / 60.0 > 10
+ORDER BY bpp_sec
+LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM bpp WHERE duration_seconds / 60.0 > 10)
+"""
+
+
+def capture_snapshot():
+    """Capture current library metrics into scan_snapshots table."""
+    if not os.path.exists(DB_PATH):
+        return None
+    conn = get_db()
+    try:
+        # Ensure table exists (for pre-existing DBs)
+        conn.execute("""CREATE TABLE IF NOT EXISTS scan_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scanned_at TEXT DEFAULT (datetime('now')),
+            total_files INTEGER, total_size_gb REAL,
+            h264_count INTEGER, hevc_count INTEGER, av1_count INTEGER,
+            res_4k INTEGER, res_1080p INTEGER, res_720p INTEGER, res_480p INTEGER, res_other INTEGER,
+            rva_up_count INTEGER, rva_down_count INTEGER,
+            mean_bpp_sec REAL, median_bpp_sec REAL
+        )""")
+        row = dict(conn.execute(SNAPSHOT_SQL).fetchone())
+        median_row = conn.execute(SNAPSHOT_MEDIAN_SQL).fetchone()
+        row["median_bpp_sec"] = median_row["median_bpp_sec"] if median_row else None
+
+        conn.execute("""INSERT INTO scan_snapshots
+            (total_files, total_size_gb, h264_count, hevc_count, av1_count,
+             res_4k, res_1080p, res_720p, res_480p, res_other,
+             rva_up_count, rva_down_count, mean_bpp_sec, median_bpp_sec)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (row["total_files"], row["total_size_gb"],
+             row["h264_count"], row["hevc_count"], row["av1_count"],
+             row["res_4k"], row["res_1080p"], row["res_720p"], row["res_480p"], row["res_other"],
+             row["rva_up_count"], row["rva_down_count"],
+             row["mean_bpp_sec"], row["median_bpp_sec"]))
+        conn.commit()
+        return row
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+def get_snapshot_history():
+    """Return all snapshots for the current library."""
+    if not os.path.exists(DB_PATH):
+        return []
+    conn = get_db()
+    try:
+        # Check if table exists
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if "scan_snapshots" not in tables:
+            return []
+        rows = conn.execute("SELECT * FROM scan_snapshots ORDER BY scanned_at ASC").fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
 class APIHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass  # Suppress default access logs
@@ -963,6 +1088,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_upgrades()
         elif path == "/api/violins":
             self.handle_violins()
+        elif path == "/api/snapshots":
+            self.handle_snapshots()
         else:
             self.send_response(404)
             self.end_headers()
@@ -975,6 +1102,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_post_config()
         elif path == "/api/libraries/switch":
             self.handle_switch_library()
+        elif path == "/api/snapshots/capture":
+            self.handle_capture_snapshot()
         elif path == "/api/scan/start":
             self.handle_scan_start()
         else:
@@ -1071,6 +1200,16 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json(get_violin_data())
         except Exception as e:
             self.send_json({"error": str(e)}, 500)
+
+    def handle_snapshots(self):
+        self.send_json(get_snapshot_history())
+
+    def handle_capture_snapshot(self):
+        result = capture_snapshot()
+        if result:
+            self.send_json({"ok": True})
+        else:
+            self.send_json({"error": "Failed to capture snapshot"}, 500)
 
     def handle_scan_start(self):
         with scan_lock:
@@ -1423,6 +1562,7 @@ td.clickable-path:hover { color: var(--green); }
     <div class="tab" data-section="dist-section">Distributions</div>
     <div class="tab" data-section="quality-section">Quality Map</div>
     <div class="tab" data-section="upgrade-section">Upgrades</div>
+    <div class="tab" data-section="progress-section">Progress</div>
     <div class="tab" data-section="sql-section">SQL Console</div>
 </div>
 
@@ -1554,6 +1694,24 @@ td.clickable-path:hover { color: var(--green); }
     <button onclick="loadUpgrades()">Load List</button>
     <span id="upgradeInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
     <div class="table-wrap" id="upgradeTableWrap" style="margin-top:12px"></div>
+</div>
+</div>
+
+<!-- PROGRESS -->
+<div class="section" id="progress-section">
+<div class="panel">
+    <p class="info">Library health tracked over time. A snapshot is captured automatically after each scan.</p>
+    <div class="controls">
+        <button onclick="loadProgress()">Refresh</button>
+        <button onclick="captureSnapshot()">Take Snapshot Now</button>
+        <span id="progressInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
+    </div>
+    <h2>Codec Migration</h2>
+    <div id="progressCodecChart" style="min-height:300px"></div>
+    <h2>Resolution Upgrades</h2>
+    <div id="progressResChart" style="min-height:300px"></div>
+    <h2>Quality Metrics</h2>
+    <div id="progressQualityChart" style="min-height:300px"></div>
 </div>
 </div>
 
@@ -1707,6 +1865,20 @@ function fmt(v) {
 
 function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
+function geekseekUrl(fileName, filePath) {
+    const isTV = /\\TV\\/i.test(filePath) || /\/TV\//i.test(filePath);
+    const category = isTV ? '5000' : '2000';
+    let name = fileName || '';
+    name = name.replace(/\.[^.]+$/, '');
+    name = name.replace(/\{[^}]*\}/g, '');
+    name = name.replace(/[._]/g, ' ');
+    name = name.replace(/\s*S\d{1,2}E\d{1,2}.*/i, '');
+    name = name.replace(/\s*(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|aac|bluray|bdrip|webrip|web-dl|hdtv|remux|dts|atmos)\b.*/i, '');
+    name = name.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/, '');
+    name = name.trim();
+    return `https://nzbgeek.info/geekseek.php?moviesgeekseek=1&c=${category}&browseincludewords=${encodeURIComponent(name)}`;
+}
+
 // Reusable client-side sortable table
 function renderSortableTable(wrapId, columns, rows) {
     const state = renderSortableTable._state = renderSortableTable._state || {};
@@ -1733,7 +1905,13 @@ function renderSortableTable(wrapId, columns, rows) {
         let cls = '';
         if (c === 'file_name') cls = ' class="clickable"';
         else if (c === 'file_path') cls = ' class="clickable-path"';
-        return `<td${cls} data-col="${escHtml(c)}" title="${escHtml(String(row[c] ?? ''))}">${escHtml(fmt(row[c]))}</td>`;
+        const val = escHtml(fmt(row[c]));
+        const title = escHtml(String(row[c] ?? ''));
+        if (c === 'file_name' && row['file_path'] != null) {
+            const href = escHtml(geekseekUrl(String(row[c] ?? ''), String(row['file_path'] ?? '')));
+            return `<td${cls} data-col="${escHtml(c)}" title="${title}"><a href="${href}" target="_blank" rel="noopener" style="color:var(--green);text-decoration:none">${val}</a></td>`;
+        }
+        return `<td${cls} data-col="${escHtml(c)}" title="${title}">${val}</td>`;
     }).join('') + '</tr>').join('');
     html += '</tbody></table>';
     document.getElementById(wrapId).innerHTML = html;
@@ -1753,23 +1931,6 @@ function handleTableClick(e) {
     const col = td.dataset.col;
     const tr = td.closest('tr');
     if (!tr) return;
-
-    if (col === 'file_name') {
-        const pathTd = tr.querySelector('td[data-col="file_path"]');
-        const filePath = pathTd ? pathTd.title : '';
-        const isTV = /\\TV\\/i.test(filePath) || /\/TV\//i.test(filePath);
-        const category = isTV ? '5000' : '2000';
-        let name = td.title || '';
-        name = name.replace(/\.[^.]+$/, '');
-        name = name.replace(/\{[^}]*\}/g, '');
-        name = name.replace(/[._]/g, ' ');
-        name = name.replace(/\s*S\d{1,2}E\d{1,2}.*/i, '');
-        name = name.replace(/\s*(1080p|720p|480p|2160p|4k|x264|x265|h264|h265|hevc|aac|bluray|bdrip|webrip|web-dl|hdtv|remux|dts|atmos)\b.*/i, '');
-        name = name.replace(/\s*[\(\[]\d{4}[\)\]]\s*$/, '');
-        name = name.trim();
-        const url = `https://nzbgeek.info/geekseek.php?moviesgeekseek=1&c=${category}&browseincludewords=${encodeURIComponent(name)}`;
-        window.open(url, '_blank');
-    }
 
     if (col === 'file_path') {
         const path = td.title || td.textContent;
@@ -2216,6 +2377,64 @@ async function loadUpgrades(force) {
     upgradeLoaded = true;
 }
 
+// Progress tracking
+async function loadProgress() {
+    const resp = await fetch('/api/snapshots');
+    const snaps = await resp.json();
+    if (!snaps.length) {
+        document.getElementById('progressInfo').textContent = 'No snapshots yet. Run a scan or click "Take Snapshot Now".';
+        return;
+    }
+    document.getElementById('progressInfo').textContent = `${snaps.length} snapshot(s)`;
+    const dates = snaps.map(s => s.scanned_at);
+
+    const darkLayout = {
+        paper_bgcolor: '#1a1a2e', plot_bgcolor: '#16213e',
+        font: { color: '#e0e0e0' },
+        xaxis: { gridcolor: '#0f3460' },
+        yaxis: { gridcolor: '#0f3460', title: 'Files' },
+        margin: { t: 30, r: 20 },
+        legend: { orientation: 'h', y: -0.2 },
+    };
+
+    // Codec migration: h264, hevc, av1 over time
+    Plotly.newPlot('progressCodecChart', [
+        { x: dates, y: snaps.map(s => s.h264_count), name: 'h264', line: { color: '#e94560' } },
+        { x: dates, y: snaps.map(s => s.hevc_count), name: 'hevc', line: { color: '#4ecca3' } },
+        { x: dates, y: snaps.map(s => s.av1_count), name: 'av1', line: { color: '#5b8def' } },
+    ], { ...darkLayout, yaxis: { ...darkLayout.yaxis, title: 'File Count' } }, { responsive: true });
+
+    // Resolution upgrades
+    Plotly.newPlot('progressResChart', [
+        { x: dates, y: snaps.map(s => s.res_4k), name: '4K', line: { color: '#4ecca3' } },
+        { x: dates, y: snaps.map(s => s.res_1080p), name: '1080p', line: { color: '#5b8def' } },
+        { x: dates, y: snaps.map(s => s.res_720p), name: '720p', line: { color: '#e0a030' } },
+        { x: dates, y: snaps.map(s => s.res_480p), name: '480p', line: { color: '#e94560' } },
+        { x: dates, y: snaps.map(s => s.res_other), name: 'other', line: { color: '#888' } },
+    ], { ...darkLayout, yaxis: { ...darkLayout.yaxis, title: 'File Count' } }, { responsive: true });
+
+    // Quality: RVA counts and mean BPP
+    Plotly.newPlot('progressQualityChart', [
+        { x: dates, y: snaps.map(s => s.rva_up_count), name: 'RVA >1.5x', line: { color: '#e94560' } },
+        { x: dates, y: snaps.map(s => s.rva_down_count), name: 'RVA <0.5x', line: { color: '#e0a030' } },
+        { x: dates, y: snaps.map(s => s.total_files), name: 'Total Files', line: { color: '#4ecca3', dash: 'dot' }, yaxis: 'y2' },
+    ], {
+        ...darkLayout,
+        yaxis: { ...darkLayout.yaxis, title: 'RVA Count' },
+        yaxis2: { title: 'Total Files', overlaying: 'y', side: 'right', gridcolor: 'transparent', color: '#4ecca3' },
+    }, { responsive: true });
+}
+
+async function captureSnapshot() {
+    const resp = await fetch('/api/snapshots/capture', { method: 'POST' });
+    const result = await resp.json();
+    if (result.ok) {
+        loadProgress();
+    } else {
+        alert(result.error || 'Failed to capture snapshot');
+    }
+}
+
 // Settings panel — multi-library
 let settingsConfig = null;
 let settingsPrevLibIdx = 0;
@@ -2472,6 +2691,12 @@ def main():
     lib = get_active_library(config)
     db = lib.get("db", args.db)
     DB_PATH = os.path.join(CONFIG_DIR, db) if not os.path.isabs(db) else db
+    refresh_views()
+
+    # Retrofit: capture initial snapshot if DB exists but has no snapshots
+    if os.path.exists(DB_PATH) and not get_snapshot_history():
+        print("Capturing initial snapshot...")
+        capture_snapshot()
 
     if not os.path.exists(DB_PATH):
         print(f"Database not found: {DB_PATH} (library: {lib['name']})")

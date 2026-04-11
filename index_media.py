@@ -92,6 +92,25 @@ CREATE INDEX IF NOT EXISTS idx_streams_codec ON streams(codec_name, codec_type);
 CREATE INDEX IF NOT EXISTS idx_streams_language ON streams(language);
 CREATE INDEX IF NOT EXISTS idx_streams_type ON streams(codec_type);
 
+CREATE TABLE IF NOT EXISTS scan_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scanned_at TEXT DEFAULT (datetime('now')),
+    total_files INTEGER,
+    total_size_gb REAL,
+    h264_count INTEGER,
+    hevc_count INTEGER,
+    av1_count INTEGER,
+    res_4k INTEGER,
+    res_1080p INTEGER,
+    res_720p INTEGER,
+    res_480p INTEGER,
+    res_other INTEGER,
+    rva_up_count INTEGER,
+    rva_down_count INTEGER,
+    mean_bpp_sec REAL,
+    median_bpp_sec REAL
+);
+
 -- Convenience view: one row per video file with primary video stream info
 CREATE VIEW IF NOT EXISTS v_video_summary AS
 SELECT
@@ -116,10 +135,10 @@ SELECT
         ELSE NULL
     END AS mb_per_minute,
     CASE
-        WHEN s.width >= 3840 OR s.height >= 2160 THEN '4K'
-        WHEN s.width >= 1920 OR s.height >= 1080 THEN '1080p'
-        WHEN s.width >= 1280 OR s.height >= 720 THEN '720p'
-        WHEN s.width >= 720 OR s.height >= 480 THEN '480p'
+        WHEN s.width >= 3680 OR s.height >= 2070 THEN '4K'
+        WHEN s.width >= 1840 OR s.height >= 1020 THEN '1080p'
+        WHEN s.width >= 1220 OR s.height >= 680 THEN '720p'
+        WHEN s.width >= 680 OR s.height >= 450 THEN '480p'
         ELSE 'other'
     END AS resolution_class
 FROM files f
@@ -175,6 +194,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # Drop views first so schema script recreates them with latest thresholds
+    for view in ["v_video_summary", "v_audio_summary", "v_subtitle_summary"]:
+        conn.execute(f"DROP VIEW IF EXISTS [{view}]")
     conn.executescript(DB_SCHEMA)
     _migrate_db(conn)
     conn.commit()
