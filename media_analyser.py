@@ -328,6 +328,35 @@ def run_scan():
             scan_state["phase"] = "swapping"
             scan_state["message"] = "Finalizing database..."
 
+        # Preserve scan_snapshots from the live DB into the temp DB
+        if os.path.exists(DB_PATH):
+            try:
+                live_conn = get_db()
+                tables = {r[0] for r in live_conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+                if "scan_snapshots" in tables:
+                    conn.execute("""CREATE TABLE IF NOT EXISTS scan_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scanned_at TEXT DEFAULT (datetime('now')),
+                        total_files INTEGER, total_size_gb REAL,
+                        h264_count INTEGER, hevc_count INTEGER, av1_count INTEGER,
+                        res_4k INTEGER, res_1080p INTEGER, res_720p INTEGER,
+                        res_480p INTEGER, res_other INTEGER,
+                        rva_up_count INTEGER, rva_down_count INTEGER,
+                        mean_bpp_sec REAL, median_bpp_sec REAL
+                    )""")
+                    for row in live_conn.execute("SELECT * FROM scan_snapshots ORDER BY id"):
+                        d = dict(row)
+                        d.pop("id")
+                        cols = list(d.keys())
+                        conn.execute(
+                            f"INSERT INTO scan_snapshots ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})",
+                            [d[c] for c in cols])
+                    conn.commit()
+                live_conn.close()
+            except Exception:
+                pass
+
         # Checkpoint and close temp DB
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
@@ -787,7 +816,37 @@ def compute_quality_data():
             "links_val": links_val,
         }
 
-        return {"heatmap": heatmap, "sankey": sankey}
+        # Scatter: x=total pixels (log), y=ratio, color=codec age
+        scatter_rows = conn.execute("""
+            WITH bpp AS (
+                SELECT *,
+                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
+                FROM v_video_summary
+                WHERE width > 0 AND height > 0 AND duration_seconds > 60
+            ),
+            avg_bpp AS (
+                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
+                FROM bpp GROUP BY resolution_class
+            )
+            SELECT b.file_name, b.video_codec, b.resolution_class,
+                   b.width * b.height AS pixels,
+                   ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio
+            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
+            WHERE b.duration_seconds / 60.0 > 10
+              AND b.bpp_sec / a.avg_bpp_sec < 5.0
+        """).fetchall()
+
+        # Group by codec for separate traces
+        scatter = {}
+        for r in scatter_rows:
+            codec = r["video_codec"]
+            if codec not in scatter:
+                scatter[codec] = {"x": [], "y": [], "text": []}
+            scatter[codec]["x"].append(r["pixels"])
+            scatter[codec]["y"].append(r["ratio"])
+            scatter[codec]["text"].append(r["file_name"])
+
+        return {"heatmap": heatmap, "sankey": sankey, "scatter": scatter}
     finally:
         conn.close()
 
@@ -1104,6 +1163,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_switch_library()
         elif path == "/api/snapshots/capture":
             self.handle_capture_snapshot()
+        elif path == "/api/snapshots/delete":
+            self.handle_delete_snapshot()
         elif path == "/api/scan/start":
             self.handle_scan_start()
         else:
@@ -1210,6 +1271,26 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
         else:
             self.send_json({"error": "Failed to capture snapshot"}, 500)
+
+    def handle_delete_snapshot(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError):
+            self.send_json({"error": "Invalid JSON"}, 400)
+            return
+        snap_id = body.get("id")
+        if not snap_id:
+            self.send_json({"error": "No snapshot ID"}, 400)
+            return
+        try:
+            conn = get_db()
+            conn.execute("DELETE FROM scan_snapshots WHERE id = ?", (snap_id,))
+            conn.commit()
+            conn.close()
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"error": str(e)}, 500)
 
     def handle_scan_start(self):
         with scan_lock:
@@ -1684,6 +1765,8 @@ td.clickable-path:hover { color: var(--green); }
     <div id="qualityHeatmap" style="min-height:450px"></div>
     <h2>Resolution &rarr; Codec Flow</h2>
     <div id="qualitySankey" style="min-height:500px"></div>
+    <h2>Every File (Scatter)</h2>
+    <div id="qualityScatter" style="min-height:500px"></div>
 </div>
 </div>
 
@@ -1712,6 +1795,8 @@ td.clickable-path:hover { color: var(--green); }
     <div id="progressResChart" style="min-height:300px"></div>
     <h2>Quality Metrics</h2>
     <div id="progressQualityChart" style="min-height:300px"></div>
+    <h2>Manage Snapshots</h2>
+    <div class="table-wrap" id="snapshotTableWrap" style="max-height:300px"></div>
 </div>
 </div>
 
@@ -2359,6 +2444,29 @@ async function loadQualityMap(force) {
         margin: { t: 20, r: 20, b: 20, l: 20 },
     }, { responsive: true });
 
+    // Scatter: x=pixels (log), y=ratio, color=codec (oldest=red, newest=green)
+    const sc = q.scatter;
+    const codecAge = {msmpeg4v3:0, mpeg4:1, mpeg2video:2, vc1:3, h264:4, hevc:5, av1:6, vvc:7};
+    const codecColor = {msmpeg4v3:'#e94560', mpeg4:'#d35530', mpeg2video:'#c97030', vc1:'#b08030',
+                        h264:'#e0a030', hevc:'#4ecca3', av1:'#5b8def', vvc:'#00e5ff'};
+    // Sort by age so oldest renders first (behind), newest on top
+    const codecs = Object.keys(sc).sort((a,b) => (codecAge[a]??99) - (codecAge[b]??99));
+    const scatterTraces = codecs.map(codec => ({
+        x: sc[codec].x, y: sc[codec].y, text: sc[codec].text, name: codec,
+        type: 'scattergl', mode: 'markers',
+        marker: { color: codecColor[codec] || '#888', size: 4, opacity: 0.6 },
+        hovertemplate: '%{text}<br>Pixels: %{x:,}<br>Ratio: %{y:.3f}<extra>' + codec + '</extra>',
+    }));
+    Plotly.newPlot('qualityScatter', scatterTraces, {
+        ...darkLayout,
+        xaxis: { title: 'Resolution (total pixels)', type: 'log', gridcolor: '#0f3460', color: '#e0e0e0' },
+        yaxis: { title: 'Ratio vs Average', gridcolor: '#0f3460', color: '#e0e0e0' },
+        shapes: [{ type: 'line', x0: 0, x1: 1, xref: 'paper', y0: 1, y1: 1,
+                   line: { color: '#e0e0e0', width: 1, dash: 'dash' } }],
+        margin: { t: 30, r: 20 },
+        legend: { orientation: 'h', y: -0.15 },
+    }, { responsive: true });
+
     document.getElementById('qualityInfo').textContent = '';
     qualityLoaded = true;
 }
@@ -2423,6 +2531,18 @@ async function loadProgress() {
         yaxis: { ...darkLayout.yaxis, title: 'RVA Count' },
         yaxis2: { title: 'Total Files', overlaying: 'y', side: 'right', gridcolor: 'transparent', color: '#4ecca3' },
     }, { responsive: true });
+
+    // Snapshot management table
+    let thtml = '<table><thead><tr><th>#</th><th>Date</th><th>Files</th><th>Size (GB)</th><th>h264</th><th>hevc</th><th>av1</th><th>1080p</th><th>720p</th><th>RVA&gt;1.5</th><th>RVA&lt;0.5</th><th></th></tr></thead><tbody>';
+    thtml += snaps.map(s =>
+        `<tr><td>${s.id}</td><td>${s.scanned_at}</td><td>${s.total_files}</td><td>${s.total_size_gb}</td>` +
+        `<td>${s.h264_count}</td><td>${s.hevc_count}</td><td>${s.av1_count}</td>` +
+        `<td>${s.res_1080p}</td><td>${s.res_720p}</td>` +
+        `<td>${s.rva_up_count}</td><td>${s.rva_down_count}</td>` +
+        `<td><button class="remove-btn" onclick="deleteSnapshot(${s.id})" title="Delete">&times;</button></td></tr>`
+    ).join('');
+    thtml += '</tbody></table>';
+    document.getElementById('snapshotTableWrap').innerHTML = thtml;
 }
 
 async function captureSnapshot() {
@@ -2433,6 +2553,18 @@ async function captureSnapshot() {
     } else {
         alert(result.error || 'Failed to capture snapshot');
     }
+}
+
+async function deleteSnapshot(id) {
+    if (!confirm('Delete snapshot #' + id + '?')) return;
+    const resp = await fetch('/api/snapshots/delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ id }),
+    });
+    const result = await resp.json();
+    if (result.ok) loadProgress();
+    else alert(result.error || 'Delete failed');
 }
 
 // Settings panel — multi-library
