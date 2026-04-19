@@ -17,7 +17,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-DB_PATH = "media.db"
+DB_PATH = "tv.db"
 CONFIG_PATH = "media_analyser_config.json"
 CONFIG_DIR = "."  # resolved in main()
 
@@ -816,7 +816,7 @@ def compute_quality_data():
             "links_val": links_val,
         }
 
-        # Scatter: x=total pixels (log), y=ratio, color=codec age
+        # Scatter comparison data for evaluating alternative x-axes
         scatter_rows = conn.execute("""
             WITH bpp AS (
                 SELECT *,
@@ -830,6 +830,11 @@ def compute_quality_data():
             )
             SELECT b.file_name, b.video_codec, b.resolution_class,
                    b.width * b.height AS pixels,
+                   ROUND(b.duration_seconds / 60.0, 2) AS duration_min,
+                   ROUND(b.file_size_bytes / 1048576.0, 2) AS size_mb,
+                   ROUND(a.avg_bpp_sec * b.width * b.height * b.duration_seconds / 1048576.0, 2) AS expected_size_mb,
+                   ROUND(b.bpp_sec, 6) AS bpp_sec,
+                   ROUND(a.avg_bpp_sec, 6) AS avg_bpp_sec,
                    ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio
             FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
             WHERE b.duration_seconds / 60.0 > 10
@@ -841,10 +846,18 @@ def compute_quality_data():
         for r in scatter_rows:
             codec = r["video_codec"]
             if codec not in scatter:
-                scatter[codec] = {"x": [], "y": [], "text": []}
-            scatter[codec]["x"].append(r["pixels"])
-            scatter[codec]["y"].append(r["ratio"])
-            scatter[codec]["text"].append(r["file_name"])
+                scatter[codec] = {"points": []}
+            scatter[codec]["points"].append({
+                "file_name": r["file_name"],
+                "resolution_class": r["resolution_class"],
+                "pixels": r["pixels"],
+                "duration_min": r["duration_min"],
+                "size_mb": r["size_mb"],
+                "expected_size_mb": r["expected_size_mb"],
+                "bpp_sec": r["bpp_sec"],
+                "avg_bpp_sec": r["avg_bpp_sec"],
+                "ratio": r["ratio"],
+            })
 
         return {"heatmap": heatmap, "sankey": sankey, "scatter": scatter}
     finally:
@@ -1758,15 +1771,17 @@ td.clickable-path:hover { color: var(--green); }
 <!-- QUALITY MAP -->
 <div class="section" id="quality-section">
 <div class="panel">
-    <p class="info">Quality heatmap shows average ratio vs average per codec/resolution combination. Sankey diagram shows file flow from resolution to codec.</p>
+    <p class="info">Quality heatmap shows average ratio vs average per codec/resolution combination.</p>
     <button onclick="loadQualityMap()">Load Charts</button>
     <span id="qualityInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
     <h2>Quality Heatmap (Codec x Resolution)</h2>
     <div id="qualityHeatmap" style="min-height:450px"></div>
     <h2>Resolution &rarr; Codec Flow</h2>
     <div id="qualitySankey" style="min-height:500px"></div>
-    <h2>Every File (Scatter)</h2>
-    <div id="qualityScatter" style="min-height:500px"></div>
+    <h2>Scatter Comparison</h2>
+    <div id="qualityScatterExpected" style="min-height:500px"></div>
+    <div id="qualityScatterDuration" style="min-height:500px"></div>
+    <div id="qualityScatterSize" style="min-height:500px"></div>
 </div>
 </div>
 
@@ -2444,28 +2459,85 @@ async function loadQualityMap(force) {
         margin: { t: 20, r: 20, b: 20, l: 20 },
     }, { responsive: true });
 
-    // Scatter: x=pixels (log), y=ratio, color=codec (oldest=red, newest=green)
+    // Scatter comparison charts: same points, different x-axes
     const sc = q.scatter;
     const codecAge = {msmpeg4v3:0, mpeg4:1, mpeg2video:2, vc1:3, h264:4, hevc:5, av1:6, vvc:7};
     const codecColor = {msmpeg4v3:'#e94560', mpeg4:'#d35530', mpeg2video:'#c97030', vc1:'#b08030',
                         h264:'#e0a030', hevc:'#4ecca3', av1:'#5b8def', vvc:'#00e5ff'};
-    // Sort by age so oldest renders first (behind), newest on top
     const codecs = Object.keys(sc).sort((a,b) => (codecAge[a]??99) - (codecAge[b]??99));
-    const scatterTraces = codecs.map(codec => ({
-        x: sc[codec].x, y: sc[codec].y, text: sc[codec].text, name: codec,
-        type: 'scattergl', mode: 'markers',
-        marker: { color: codecColor[codec] || '#888', size: 4, opacity: 0.6 },
-        hovertemplate: '%{text}<br>Pixels: %{x:,}<br>Ratio: %{y:.3f}<extra>' + codec + '</extra>',
-    }));
-    Plotly.newPlot('qualityScatter', scatterTraces, {
-        ...darkLayout,
-        xaxis: { title: 'Resolution (total pixels)', type: 'log', gridcolor: '#0f3460', color: '#e0e0e0' },
-        yaxis: { title: 'Ratio vs Average', gridcolor: '#0f3460', color: '#e0e0e0' },
-        shapes: [{ type: 'line', x0: 0, x1: 1, xref: 'paper', y0: 1, y1: 1,
-                   line: { color: '#e0e0e0', width: 1, dash: 'dash' } }],
-        margin: { t: 30, r: 20 },
-        legend: { orientation: 'h', y: -0.15 },
-    }, { responsive: true });
+    const scatterConfigs = [
+        {
+            elementId: 'qualityScatterExpected',
+            title: 'X = Expected Size At Average Density',
+            xKey: 'expected_size_mb',
+            xLabel: 'Expected size at average density (MB)',
+            xType: 'log',
+            xValue: point => Number(point.expected_size_mb).toLocaleString(undefined, { maximumFractionDigits: 2 }),
+            xHoverLabel: 'Expected size',
+        },
+        {
+            elementId: 'qualityScatterDuration',
+            title: 'X = Duration',
+            xKey: 'duration_min',
+            xLabel: 'Duration (minutes)',
+            xType: 'log',
+            xValue: point => Number(point.duration_min).toLocaleString(undefined, { maximumFractionDigits: 2 }),
+            xHoverLabel: 'Duration',
+        },
+        {
+            elementId: 'qualityScatterSize',
+            title: 'X = Actual Size',
+            xKey: 'size_mb',
+            xLabel: 'Actual file size (MB)',
+            xType: 'log',
+            xValue: point => Number(point.size_mb).toLocaleString(undefined, { maximumFractionDigits: 2 }),
+            xHoverLabel: 'Actual size',
+        },
+    ];
+
+    function pointHoverText(point, xHoverLabel, xValue) {
+        return [
+            escHtml(point.file_name),
+            `Resolution class: ${escHtml(point.resolution_class)}`,
+            `${xHoverLabel}: ${xValue(point)}`,
+            `Ratio: ${Number(point.ratio).toFixed(3)}`,
+            `Actual size: ${Number(point.size_mb).toLocaleString(undefined, { maximumFractionDigits: 2 })} MB`,
+            `Expected size: ${Number(point.expected_size_mb).toLocaleString(undefined, { maximumFractionDigits: 2 })} MB`,
+            `Duration: ${Number(point.duration_min).toLocaleString(undefined, { maximumFractionDigits: 2 })} min`,
+            `Pixels: ${Number(point.pixels).toLocaleString()}`,
+            `BPP/sec: ${Number(point.bpp_sec).toLocaleString(undefined, { maximumFractionDigits: 6 })}`,
+            `Avg BPP/sec: ${Number(point.avg_bpp_sec).toLocaleString(undefined, { maximumFractionDigits: 6 })}`,
+        ].join('<br>');
+    }
+
+    function renderQualityScatter(config) {
+        const traces = codecs.map(codec => {
+            const points = (sc[codec] && sc[codec].points ? sc[codec].points : []).filter(point => Number(point[config.xKey]) > 0);
+            return {
+                x: points.map(point => point[config.xKey]),
+                y: points.map(point => point.ratio),
+                text: points.map(point => pointHoverText(point, config.xHoverLabel, config.xValue)),
+                name: codec,
+                type: 'scattergl',
+                mode: 'markers',
+                marker: { color: codecColor[codec] || '#888', size: 4, opacity: 0.6 },
+                hovertemplate: '%{text}<extra>' + codec + '</extra>',
+            };
+        }).filter(trace => trace.x.length > 0);
+
+        Plotly.newPlot(config.elementId, traces, {
+            ...darkLayout,
+            title: { text: config.title, font: { color: '#e0e0e0', size: 16 } },
+            xaxis: { title: config.xLabel, type: config.xType, gridcolor: '#0f3460', color: '#e0e0e0' },
+            yaxis: { title: 'Ratio vs Average', gridcolor: '#0f3460', color: '#e0e0e0' },
+            shapes: [{ type: 'line', x0: 0, x1: 1, xref: 'paper', y0: 1, y1: 1,
+                       line: { color: '#e0e0e0', width: 1, dash: 'dash' } }],
+            margin: { t: 50, r: 20 },
+            legend: { orientation: 'h', y: -0.15 },
+        }, { responsive: true });
+    }
+
+    scatterConfigs.forEach(renderQualityScatter);
 
     document.getElementById('qualityInfo').textContent = '';
     qualityLoaded = true;
