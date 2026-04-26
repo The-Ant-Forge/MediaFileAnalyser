@@ -1748,6 +1748,8 @@ td.clickable-path:hover { color: var(--green); }
 <div class="panel">
     <p class="info">Per-pixel Bytes Per Second normalized against resolution class average. Shows files with duration &gt; 10 minutes, ordered by ratio vs average (highest first).</p>
     <button onclick="loadPBPS()">Run Analysis</button>
+    <input type="text" id="pbpsFilter" placeholder="Filter by file name..." style="margin-left:8px;width:240px"
+           oninput="applyTableFilter('pbpsTableWrap', this.value)">
     <span id="pbpsInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
     <div class="table-wrap" id="pbpsTableWrap" style="margin-top:12px"></div>
 </div>
@@ -1790,6 +1792,8 @@ td.clickable-path:hover { color: var(--green); }
 <div class="panel">
     <p class="info">Files scored by upgrade urgency: old codecs (h264, mpeg2, vc1), low resolution (&le;720p), and abnormal bitrate ratios. Higher score = more urgent.</p>
     <button onclick="loadUpgrades()">Load List</button>
+    <input type="text" id="upgradeFilter" placeholder="Filter by file name..." style="margin-left:8px;width:240px"
+           oninput="applyTableFilter('upgradeTableWrap', this.value)">
     <span id="upgradeInfo" style="color:var(--text2);font-size:0.85em;margin-left:8px"></span>
     <div class="table-wrap" id="upgradeTableWrap" style="margin-top:12px"></div>
 </div>
@@ -1982,10 +1986,13 @@ function geekseekUrl(fileName, filePath) {
 // Reusable client-side sortable table
 function renderSortableTable(wrapId, columns, rows) {
     const state = renderSortableTable._state = renderSortableTable._state || {};
-    if (!state[wrapId]) state[wrapId] = { col: '', dir: 'asc', columns: [], rows: [] };
+    if (!state[wrapId]) state[wrapId] = { col: '', dir: 'asc', columns: [], rows: [], filter: '' };
     if (columns) { state[wrapId].columns = columns; state[wrapId].rows = rows; state[wrapId].col = ''; state[wrapId].dir = 'asc'; }
     const s = state[wrapId];
-    let sorted = [...s.rows];
+    // Apply file_name filter (case-insensitive substring match)
+    let sorted = s.filter
+        ? s.rows.filter(r => String(r.file_name ?? '').toLowerCase().includes(s.filter.toLowerCase()))
+        : [...s.rows];
     if (s.col) {
         sorted.sort((a, b) => {
             let va = a[s.col], vb = b[s.col];
@@ -2021,6 +2028,13 @@ function sortTableCol(wrapId, col) {
     const s = renderSortableTable._state[wrapId];
     if (s.col === col) s.dir = s.dir === 'asc' ? 'desc' : 'asc';
     else { s.col = col; s.dir = 'asc'; }
+    renderSortableTable(wrapId);
+}
+
+function applyTableFilter(wrapId, filter) {
+    const state = renderSortableTable._state || {};
+    if (!state[wrapId]) return;
+    state[wrapId].filter = filter;
     renderSortableTable(wrapId);
 }
 
