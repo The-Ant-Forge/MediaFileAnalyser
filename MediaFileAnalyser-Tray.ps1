@@ -108,6 +108,39 @@ function Open-Browser {
     Start-Process $script:BaseUrl
 }
 
+function Find-ExistingServer {
+    # Look for any python.exe running media_analyser on our port
+    $procs = Get-WmiObject Win32_Process -Filter "Name='python.exe'" 2>$null |
+        Where-Object { $_.CommandLine -like "*media_analyser*--port $script:Port*" }
+    if ($procs) {
+        $first = $procs | Select-Object -First 1
+        try {
+            return [System.Diagnostics.Process]::GetProcessById($first.ProcessId)
+        } catch {
+            return $null
+        }
+    }
+    return $null
+}
+
+function Sync-ServerState {
+    # Reflect actual server state in the tray UI
+    $existing = Find-ExistingServer
+    if ($existing) {
+        $script:ServerProcess = $existing
+        $script:TrayIcon.Icon = New-AppIcon -Running $true
+        $script:TrayIcon.Text = "Media File Analyser - Running on port $script:Port"
+        $script:StartItem.Enabled = $false
+        $script:StopItem.Enabled = $true
+    } else {
+        $script:ServerProcess = $null
+        $script:TrayIcon.Icon = New-AppIcon -Running $false
+        $script:TrayIcon.Text = "Media File Analyser - Stopped"
+        $script:StartItem.Enabled = $true
+        $script:StopItem.Enabled = $false
+    }
+}
+
 # --- Build tray icon and context menu ---
 $script:TrayIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:TrayIcon.Icon = New-AppIcon -Running $false
@@ -147,10 +180,22 @@ $exitItem.Add_Click({
 })
 $contextMenu.Items.Add($exitItem) | Out-Null
 
+# Also stop the server if PowerShell exits unexpectedly (e.g. user kills host)
+Register-EngineEvent -SourceIdentifier ([System.Management.Automation.PsEngineEvent]::Exiting) -Action {
+    $procs = Get-WmiObject Win32_Process -Filter "Name='python.exe'" 2>$null |
+        Where-Object { $_.CommandLine -like "*media_analyser*--port $using:Port*" }
+    foreach ($p in $procs) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+} | Out-Null
+
 $script:TrayIcon.ContextMenuStrip = $contextMenu
 
 # Double-click opens browser
 $script:TrayIcon.Add_DoubleClick({ Open-Browser })
+
+# Detect any pre-existing server and reflect it in the menu
+Sync-ServerState
 
 # --- Run message loop ---
 [System.Windows.Forms.Application]::Run()
