@@ -2591,12 +2591,18 @@ async function loadProgress() {
         legend: { orientation: 'h', y: -0.2 },
     };
 
-    // Codec migration: h264, hevc, av1 over time
+    // Codec migration: h264, hevc, av1 over time, with mean/median BPP on right axis
     Plotly.newPlot('progressCodecChart', [
         { x: dates, y: snaps.map(s => s.h264_count), name: 'h264', line: { color: '#e94560' } },
         { x: dates, y: snaps.map(s => s.hevc_count), name: 'hevc', line: { color: '#4ecca3' } },
         { x: dates, y: snaps.map(s => s.av1_count), name: 'av1', line: { color: '#5b8def' } },
-    ], { ...darkLayout, yaxis: { ...darkLayout.yaxis, title: 'File Count' } }, { responsive: true });
+        { x: dates, y: snaps.map(s => s.mean_bpp_sec), name: 'Mean BPP/s', line: { color: '#e0a030', dash: 'dot' }, yaxis: 'y2' },
+        { x: dates, y: snaps.map(s => s.median_bpp_sec), name: 'Median BPP/s', line: { color: '#b06be0', dash: 'dot' }, yaxis: 'y2' },
+    ], {
+        ...darkLayout,
+        yaxis: { ...darkLayout.yaxis, title: 'File Count' },
+        yaxis2: { title: 'BPP/sec', overlaying: 'y', side: 'right', gridcolor: 'transparent', color: '#e0a030' },
+    }, { responsive: true });
 
     // Resolution upgrades
     Plotly.newPlot('progressResChart', [
