@@ -418,9 +418,9 @@ def refresh_views():
         return
     try:
         conn = get_db()
-        for view in ["v_video_summary", "v_audio_summary", "v_subtitle_summary"]:
+        from index_media import DB_SCHEMA, VIEW_NAMES
+        for view in VIEW_NAMES:
             conn.execute(f"DROP VIEW IF EXISTS [{view}]")
-        from index_media import DB_SCHEMA
         conn.executescript(DB_SCHEMA)
         conn.close()
     except Exception:
@@ -436,29 +436,11 @@ def dict_rows(cursor):
 # ---------------------------------------------------------------------------
 _pbps_tiles_cache = {"data": None}
 
-PBPS_TILES_SQL = """
-WITH bpp AS (
-    SELECT *,
-           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-),
-avg_bpp AS (
-    SELECT resolution_class,
-           AVG(bpp_sec) AS avg_bpp_sec
-    FROM bpp
-    GROUP BY resolution_class
-),
-joined AS (
-    SELECT b.bpp_sec,
-           b.bpp_sec / a.avg_bpp_sec AS ratio_vs_avg,
-           b.video_codec,
-           b.resolution_class,
-           b.duration_seconds
-    FROM bpp b
-    JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-    WHERE b.duration_seconds / 60.0 > 10
-)
+# Quality stats cover "feature length" files: a valid bpp_sec and longer than 10 minutes.
+# bpp_sec, avg_bpp_for_res and ratio_vs_avg all come from v_video_metrics (see index_media.py).
+FEATURE_WHERE = "bpp_sec IS NOT NULL AND duration_seconds / 60.0 > 10"
+
+PBPS_TILES_SQL = f"""
 SELECT
     SUM(CASE WHEN ratio_vs_avg > 1.5 THEN 1 ELSE 0 END) AS rva_up_count,
     SUM(CASE WHEN ratio_vs_avg < 0.5 THEN 1 ELSE 0 END) AS rva_down_count,
@@ -468,33 +450,25 @@ SELECT
     SUM(CASE WHEN video_codec = 'av1' THEN 1 ELSE 0 END) AS av1_count,
     SUM(CASE WHEN resolution_class IN ('4K', '1080p') THEN 1 ELSE 0 END) AS high_res_count,
     COUNT(*) AS total_files
-FROM joined
+FROM v_video_metrics
+WHERE {FEATURE_WHERE}
 """
 
-PBPS_MEDIAN_SQL = """
-WITH bpp AS (
-    SELECT file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec,
-           duration_seconds
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
+MEDIAN_BPP_SQL = f"""
+WITH feature AS (
+    SELECT bpp_sec FROM v_video_metrics WHERE {FEATURE_WHERE}
 )
 SELECT ROUND(bpp_sec, 6) AS median_bpp_sec
-FROM bpp
-WHERE duration_seconds / 60.0 > 10
+FROM feature
 ORDER BY bpp_sec
-LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM bpp WHERE duration_seconds / 60.0 > 10)
+LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM feature)
 """
 
 
-PBPS_CODEC_SQL = """
-WITH bpp AS (
-    SELECT video_codec, duration_seconds
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-      AND duration_seconds / 60.0 > 10
-)
+PBPS_CODEC_SQL = f"""
 SELECT video_codec, COUNT(*) AS cnt
-FROM bpp
+FROM v_video_metrics
+WHERE {FEATURE_WHERE}
 GROUP BY video_codec
 ORDER BY cnt DESC
 """
@@ -504,7 +478,7 @@ def compute_pbps_tiles():
     conn = get_db()
     try:
         row = dict(conn.execute(PBPS_TILES_SQL).fetchone())
-        median_row = conn.execute(PBPS_MEDIAN_SQL).fetchone()
+        median_row = conn.execute(MEDIAN_BPP_SQL).fetchone()
         row["median_bpp_sec"] = median_row["median_bpp_sec"] if median_row else None
 
         # Top 3 codecs + other
@@ -521,39 +495,22 @@ def compute_pbps_tiles():
         row["codecs"] = codecs
 
         # Ratio distribution histogram (0.1-wide buckets, 0.4 to 1.6)
-        hist_rows = conn.execute("""
-            WITH bpp AS (
-                SELECT *,
-                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-                FROM v_video_summary
-                WHERE width > 0 AND height > 0 AND duration_seconds > 60
-            ),
-            avg_bpp AS (
-                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-                FROM bpp GROUP BY resolution_class
-            ),
-            joined AS (
-                SELECT b.bpp_sec / a.avg_bpp_sec AS ratio
-                FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-                WHERE b.duration_seconds / 60.0 > 10
-                  AND b.bpp_sec / a.avg_bpp_sec >= 0.4
-                  AND b.bpp_sec / a.avg_bpp_sec < 1.6
-            ),
-            buckets AS (
-                SELECT CAST(ratio / 0.1 AS INTEGER) AS bucket,
-                       COUNT(*) AS cnt
-                FROM joined GROUP BY bucket
-            )
-            SELECT bucket, cnt FROM buckets ORDER BY bucket
+        hist_rows = conn.execute(f"""
+            SELECT CAST(ratio_vs_avg / 0.1 AS INTEGER) AS bucket,
+                   COUNT(*) AS cnt
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
+              AND ratio_vs_avg >= 0.4 AND ratio_vs_avg < 1.6
+            GROUP BY bucket
+            ORDER BY bucket
         """).fetchall()
         row["ratio_hist"] = [{"bucket": r["bucket"], "count": r["cnt"]} for r in hist_rows]
 
         # Resolution distribution
-        res_rows = conn.execute("""
+        res_rows = conn.execute(f"""
             SELECT resolution_class, COUNT(*) AS cnt
-            FROM v_video_summary
-            WHERE width > 0 AND height > 0 AND duration_seconds > 60
-              AND duration_seconds / 60.0 > 10
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
             GROUP BY resolution_class
         """).fetchall()
         res_map = {r["resolution_class"]: r["cnt"] for r in res_rows}
@@ -585,29 +542,13 @@ def invalidate_pbps_tiles_cache():
 # ---------------------------------------------------------------------------
 _distributions_cache = {"data": None}
 
-DISTRIBUTIONS_SQL = """
-WITH bpp AS (
-    SELECT *,
-           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-),
-avg_bpp AS (
-    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-    FROM bpp GROUP BY resolution_class
-),
-joined AS (
-    SELECT b.video_codec, b.resolution_class,
-           b.bpp_sec / a.avg_bpp_sec AS ratio
-    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-    WHERE b.duration_seconds / 60.0 > 10
-      AND b.bpp_sec / a.avg_bpp_sec >= 0.4
-      AND b.bpp_sec / a.avg_bpp_sec < 1.6
-)
-SELECT CAST(ratio / 0.1 AS INTEGER) AS bucket,
+DISTRIBUTIONS_SQL = f"""
+SELECT CAST(ratio_vs_avg / 0.1 AS INTEGER) AS bucket,
        video_codec, resolution_class,
        COUNT(*) AS cnt
-FROM joined
+FROM v_video_metrics
+WHERE {FEATURE_WHERE}
+  AND ratio_vs_avg >= 0.4 AND ratio_vs_avg < 1.6
 GROUP BY bucket, video_codec, resolution_class
 ORDER BY bucket
 """
@@ -698,23 +639,13 @@ def compute_quality_data():
     conn = get_db()
     try:
         # Heatmap: avg ratio_vs_avg per codec x resolution
-        heatmap_rows = conn.execute("""
-            WITH bpp AS (
-                SELECT *,
-                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-                FROM v_video_summary
-                WHERE width > 0 AND height > 0 AND duration_seconds > 60
-            ),
-            avg_bpp AS (
-                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-                FROM bpp GROUP BY resolution_class
-            )
-            SELECT b.video_codec, b.resolution_class,
-                   ROUND(AVG(b.bpp_sec / a.avg_bpp_sec), 3) AS avg_ratio,
+        heatmap_rows = conn.execute(f"""
+            SELECT video_codec, resolution_class,
+                   ROUND(AVG(ratio_vs_avg), 3) AS avg_ratio,
                    COUNT(*) AS cnt
-            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-            WHERE b.duration_seconds / 60.0 > 10
-            GROUP BY b.video_codec, b.resolution_class
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
+            GROUP BY video_codec, resolution_class
         """).fetchall()
 
         # Build heatmap matrix — codec order: oldest → newest
@@ -752,11 +683,10 @@ def compute_quality_data():
         }
 
         # Sankey: resolution → codec flow
-        sankey_rows = conn.execute("""
+        sankey_rows = conn.execute(f"""
             SELECT resolution_class, video_codec, COUNT(*) AS cnt
-            FROM v_video_summary
-            WHERE width > 0 AND height > 0 AND duration_seconds > 60
-              AND duration_seconds / 60.0 > 10
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
             GROUP BY resolution_class, video_codec
             ORDER BY cnt DESC
         """).fetchall()
@@ -817,28 +747,16 @@ def compute_quality_data():
         }
 
         # Scatter comparison data for evaluating alternative x-axes
-        scatter_rows = conn.execute("""
-            WITH bpp AS (
-                SELECT *,
-                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-                FROM v_video_summary
-                WHERE width > 0 AND height > 0 AND duration_seconds > 60
-            ),
-            avg_bpp AS (
-                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-                FROM bpp GROUP BY resolution_class
-            )
-            SELECT b.file_name, b.video_codec, b.resolution_class,
-                   b.width * b.height AS pixels,
-                   ROUND(b.duration_seconds / 60.0, 2) AS duration_min,
-                   ROUND(b.file_size_bytes / 1048576.0, 2) AS size_mb,
-                   ROUND(a.avg_bpp_sec * b.width * b.height * b.duration_seconds / 1048576.0, 2) AS expected_size_mb,
-                   ROUND(b.bpp_sec, 6) AS bpp_sec,
-                   ROUND(a.avg_bpp_sec, 6) AS avg_bpp_sec,
-                   ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio
-            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-            WHERE b.duration_seconds / 60.0 > 10
-              AND b.bpp_sec / a.avg_bpp_sec < 5.0
+        scatter_rows = conn.execute(f"""
+            SELECT file_name, video_codec, resolution_class,
+                   pixels, duration_min, size_mb,
+                   ROUND(expected_size_mb, 2) AS expected_size_mb,
+                   ROUND(bpp_sec, 6) AS bpp_sec,
+                   ROUND(avg_bpp_for_res, 6) AS avg_bpp_sec,
+                   ROUND(ratio_vs_avg, 4) AS ratio
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
+              AND ratio_vs_avg < 5.0
         """).fetchall()
 
         # Group by codec for separate traces
@@ -879,53 +797,20 @@ def invalidate_quality_cache():
 # ---------------------------------------------------------------------------
 _upgrade_cache = {"data": None}
 
+# Penalties and upgrade_score are defined in v_video_metrics (higher = more urgent upgrade)
 UPGRADE_SQL = """
-WITH bpp AS (
-    SELECT *,
-           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-      AND duration_seconds / 60.0 > 10
-),
-avg_bpp AS (
-    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-    FROM bpp GROUP BY resolution_class
-),
-scored AS (
-    SELECT b.file_name, b.file_path, b.video_codec, b.resolution_class,
-           b.width, b.height,
-           ROUND(b.bpp_sec / a.avg_bpp_sec, 3) AS ratio_vs_avg,
-           ROUND(b.file_size_bytes / 1048576.0, 1) AS size_mb,
-           ROUND(b.duration_seconds / 60.0, 1) AS dur_min,
-           b.file_size_bytes,
-           -- Score components (higher = more urgent upgrade)
-           CASE WHEN b.video_codec = 'h264' THEN 3
-                WHEN b.video_codec = 'mpeg2video' THEN 5
-                WHEN b.video_codec = 'vc1' THEN 4
-                WHEN b.video_codec = 'msmpeg4v3' THEN 5
-                ELSE 0 END AS codec_penalty,
-           CASE WHEN b.resolution_class = '480p' THEN 4
-                WHEN b.resolution_class = 'other' THEN 5
-                WHEN b.resolution_class = '720p' THEN 2
-                ELSE 0 END AS res_penalty,
-           CASE WHEN b.bpp_sec / a.avg_bpp_sec > 2.0 THEN 3
-                WHEN b.bpp_sec / a.avg_bpp_sec > 1.5 THEN 2
-                WHEN b.bpp_sec / a.avg_bpp_sec < 0.3 THEN 3
-                WHEN b.bpp_sec / a.avg_bpp_sec < 0.5 THEN 1
-                ELSE 0 END AS ratio_penalty
-    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-)
 SELECT file_name, file_path, video_codec, resolution_class,
        width || 'x' || height AS resolution,
-       ratio_vs_avg, size_mb, dur_min,
-       codec_penalty + res_penalty + ratio_penalty AS upgrade_score,
+       ROUND(ratio_vs_avg, 3) AS ratio_vs_avg,
+       ROUND(file_size_bytes / 1048576.0, 1) AS size_mb,
+       ROUND(duration_seconds / 60.0, 1) AS dur_min,
+       upgrade_score,
        CASE WHEN codec_penalty > 0 THEN 'old codec' ELSE '' END ||
        CASE WHEN res_penalty > 0 THEN ' low res' ELSE '' END ||
        CASE WHEN ratio_penalty > 0 THEN ' bad ratio' ELSE '' END AS reasons
-FROM scored
-WHERE codec_penalty + res_penalty + ratio_penalty > 0
-ORDER BY codec_penalty + res_penalty + ratio_penalty DESC,
-         file_size_bytes DESC
+FROM v_video_metrics
+WHERE upgrade_score > 0
+ORDER BY upgrade_score DESC, file_size_bytes DESC
 """
 
 
@@ -959,22 +844,12 @@ _violin_cache = {"data": None}
 def compute_violin_data():
     conn = get_db()
     try:
-        rows = conn.execute("""
-            WITH bpp AS (
-                SELECT *,
-                       file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-                FROM v_video_summary
-                WHERE width > 0 AND height > 0 AND duration_seconds > 60
-            ),
-            avg_bpp AS (
-                SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-                FROM bpp GROUP BY resolution_class
-            )
-            SELECT b.resolution_class,
-                   ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio
-            FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-            WHERE b.duration_seconds / 60.0 > 10
-              AND b.bpp_sec / a.avg_bpp_sec < 5.0
+        rows = conn.execute(f"""
+            SELECT resolution_class,
+                   ROUND(ratio_vs_avg, 4) AS ratio
+            FROM v_video_metrics
+            WHERE {FEATURE_WHERE}
+              AND ratio_vs_avg < 5.0
         """).fetchall()
 
         # Group by resolution
@@ -1004,24 +879,7 @@ def invalidate_violin_cache():
 # ---------------------------------------------------------------------------
 # Scan snapshots — track library health over time
 # ---------------------------------------------------------------------------
-SNAPSHOT_SQL = """
-WITH bpp AS (
-    SELECT *,
-           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-),
-avg_bpp AS (
-    SELECT resolution_class, AVG(bpp_sec) AS avg_bpp_sec
-    FROM bpp GROUP BY resolution_class
-),
-joined AS (
-    SELECT b.bpp_sec, b.bpp_sec / a.avg_bpp_sec AS ratio_vs_avg,
-           b.video_codec, b.resolution_class,
-           b.file_size_bytes, b.duration_seconds
-    FROM bpp b JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-    WHERE b.duration_seconds / 60.0 > 10
-)
+SNAPSHOT_SQL = f"""
 SELECT
     COUNT(*) AS total_files,
     ROUND(SUM(file_size_bytes) / 1073741824.0, 2) AS total_size_gb,
@@ -1036,20 +894,8 @@ SELECT
     SUM(CASE WHEN ratio_vs_avg > 1.5 THEN 1 ELSE 0 END) AS rva_up_count,
     SUM(CASE WHEN ratio_vs_avg < 0.5 THEN 1 ELSE 0 END) AS rva_down_count,
     ROUND(AVG(bpp_sec), 6) AS mean_bpp_sec
-FROM joined
-"""
-
-SNAPSHOT_MEDIAN_SQL = """
-WITH bpp AS (
-    SELECT file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec,
-           duration_seconds
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-)
-SELECT ROUND(bpp_sec, 6) AS median_bpp_sec
-FROM bpp WHERE duration_seconds / 60.0 > 10
-ORDER BY bpp_sec
-LIMIT 1 OFFSET (SELECT COUNT(*) / 2 FROM bpp WHERE duration_seconds / 60.0 > 10)
+FROM v_video_metrics
+WHERE {FEATURE_WHERE}
 """
 
 
@@ -1070,7 +916,7 @@ def capture_snapshot():
             mean_bpp_sec REAL, median_bpp_sec REAL
         )""")
         row = dict(conn.execute(SNAPSHOT_SQL).fetchone())
-        median_row = conn.execute(SNAPSHOT_MEDIAN_SQL).fetchone()
+        median_row = conn.execute(MEDIAN_BPP_SQL).fetchone()
         row["median_bpp_sec"] = median_row["median_bpp_sec"] if median_row else None
 
         conn.execute("""INSERT INTO scan_snapshots
@@ -1325,6 +1171,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_json({
             "views": [
                 {"name": "v_video_summary", "label": "Video Summary"},
+                {"name": "v_video_metrics", "label": "Video + Quality Metrics"},
                 {"name": "v_audio_summary", "label": "Audio Summary"},
                 {"name": "v_subtitle_summary", "label": "Subtitle Summary"},
                 {"name": "files", "label": "All Files"},
@@ -1335,7 +1182,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_data(self, params):
         """Paginated, sortable, filterable data from a view."""
         view = params.get("view", ["v_video_summary"])[0]
-        allowed = {"v_video_summary", "v_audio_summary", "v_subtitle_summary",
+        allowed = {"v_video_metrics", "v_video_summary", "v_audio_summary", "v_subtitle_summary",
                     "files", "streams"}
         if view not in allowed:
             self.send_json({"error": "Invalid view"}, 400)
@@ -1404,7 +1251,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def handle_stats(self, params):
         """Compute mean/std for numerical columns, optionally grouped."""
         view = params.get("view", ["v_video_summary"])[0]
-        allowed = {"v_video_summary", "v_audio_summary", "v_subtitle_summary",
+        allowed = {"v_video_metrics", "v_video_summary", "v_audio_summary", "v_subtitle_summary",
                     "files", "streams"}
         if view not in allowed:
             self.send_json({"error": "Invalid view"}, 400)
@@ -1470,11 +1317,18 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_json({"error": "Only SELECT queries allowed"}, 400)
             return
 
+        # Row cap protects the SQL console; callers that need everything (charts) pass limit=0
+        try:
+            limit = int(params.get("limit", ["5000"])[0])
+        except ValueError:
+            limit = 5000
+
         conn = get_db()
         try:
             cursor = conn.execute(sql)
             columns = [d[0] for d in cursor.description] if cursor.description else []
-            rows = [dict(zip(columns, row)) for row in cursor.fetchmany(5000)]
+            fetched = cursor.fetchall() if limit <= 0 else cursor.fetchmany(limit)
+            rows = [dict(zip(columns, row)) for row in fetched]
             self.send_json({"columns": columns, "rows": rows, "total": len(rows)})
         except sqlite3.Error as e:
             self.send_json({"error": str(e)}, 400)
@@ -1551,6 +1405,23 @@ tr:hover td { background: rgba(233,69,96,0.18); }
          border: 1px solid var(--border); }
 .chart-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
 .chart-controls label { font-size: 0.8em; color: var(--text2); display: flex; flex-direction: column; gap: 2px; }
+
+/* Searchable combobox (wraps a hidden <select>) */
+.combo { position: relative; }
+.combo-input { width: 240px; font-size: 1.05em; }
+.combo-list { display: none; position: absolute; top: 100%; left: 0; z-index: 20; margin-top: 2px;
+              min-width: 100%; width: max-content; max-width: 460px; max-height: 340px; overflow-y: auto;
+              background: var(--surface); border: 1px solid var(--accent); border-radius: 4px;
+              box-shadow: 0 6px 18px rgba(0,0,0,0.5); }
+.combo.open .combo-list { display: block; }
+.combo-group { position: sticky; top: 0; padding: 4px 10px; background: var(--bg); color: var(--green);
+               font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.05em; }
+.combo-item { display: flex; justify-content: space-between; gap: 16px; padding: 4px 10px;
+              cursor: pointer; color: var(--text); font-size: 1.05em; }
+.combo-item .col { color: var(--text2); font-family: monospace; }
+.combo-item.sel { color: var(--accent); }
+.combo-item.hl { background: var(--accent2); }
+.combo-empty { padding: 6px 10px; color: var(--text2); }
 
 /* SQL */
 textarea { width: 100%; min-height: 80px; font-family: 'Fira Code', monospace; resize: vertical; }
@@ -1738,6 +1609,7 @@ td.clickable-path:hover { color: var(--green); }
             </select>
         </label>
         <button onclick="renderChart()">Draw Chart</button>
+        <span id="chartInfo" class="info" style="align-self:center;margin:0"></span>
     </div>
     <div id="chart"></div>
 </div>
@@ -1922,6 +1794,8 @@ async function init() {
     document.getElementById('viewSelect').onchange = () => { currentOffset = 0; loadData(); };
     document.getElementById('statsViewSelect').onchange = loadStatsColumns;
     document.getElementById('chartViewSelect').onchange = loadChartColumns;
+    document.getElementById('chartViewSelect').value = 'v_video_metrics';
+    for (const id of ['chartX', 'chartY', 'chartColor']) initCombo(id);
     document.getElementById('searchBox').addEventListener('keydown', e => { if (e.key === 'Enter') loadData(); });
     loadData();
     loadStatsColumns();
@@ -2123,16 +1997,186 @@ async function loadStats() {
     document.getElementById('statsTableWrap').innerHTML = html;
 }
 
+// Searchable combobox: an input + filtered list that drives a hidden <select>.
+// The <select> stays the source of truth, so callers keep reading select.value.
+// Options may carry data-search (extra match text); <optgroup>s become list headings.
+const combos = {};
+
+function initCombo(selectId) {
+    const sel = document.getElementById(selectId);
+    sel.hidden = true;
+    const wrap = document.createElement('div');
+    wrap.className = 'combo';
+    const input = document.createElement('input');
+    input.className = 'combo-input';
+    input.placeholder = 'Type to search...';
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    const list = document.createElement('div');
+    list.className = 'combo-list';
+    wrap.append(input, list);
+    sel.before(wrap);  // before the select so an enclosing <label> focuses the input
+
+    let items = [], hl = -1;
+
+    function sync() {
+        const o = sel.selectedOptions[0];
+        input.value = o ? o.textContent : '';
+        input.title = o ? o.value : '';
+    }
+    function groups() {
+        const out = [];
+        for (const child of sel.children) {
+            if (child.tagName === 'OPTGROUP') {
+                out.push({ label: child.label, options: [...child.children] });
+            } else {
+                const last = out[out.length - 1];
+                if (last && !last.label) last.options.push(child);
+                else out.push({ label: '', options: [child] });
+            }
+        }
+        return out;
+    }
+    function setHl(i) {
+        if (items[hl]) items[hl].div.classList.remove('hl');
+        hl = i;
+        if (items[hl]) {
+            items[hl].div.classList.add('hl');
+            items[hl].div.scrollIntoView({ block: 'nearest' });
+        }
+    }
+    function open(query) {
+        const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+        list.innerHTML = '';
+        items = [];
+        hl = -1;
+        for (const g of groups()) {
+            const matches = g.options.filter(o => {
+                const hay = (o.value + ' ' + o.textContent + ' ' + (o.dataset.search || '')).toLowerCase();
+                return terms.every(t => hay.includes(t));
+            });
+            if (!matches.length) continue;
+            if (g.label) list.insertAdjacentHTML('beforeend', `<div class="combo-group">${escHtml(g.label)}</div>`);
+            for (const o of matches) {
+                const div = document.createElement('div');
+                div.className = 'combo-item' + (o.selected ? ' sel' : '');
+                div.innerHTML = `<span>${escHtml(o.textContent)}</span>` +
+                    (o.value && o.value !== o.textContent ? `<span class="col">${escHtml(o.value)}</span>` : '');
+                const idx = items.length;
+                div.onmousedown = e => { e.preventDefault(); pick(o); };
+                div.onmousemove = () => { if (hl !== idx) setHl(idx); };
+                list.appendChild(div);
+                items.push({ div, o });
+            }
+        }
+        if (!items.length) list.innerHTML = '<div class="combo-empty">No matching columns</div>';
+        wrap.classList.add('open');
+        const selIdx = terms.length ? -1 : items.findIndex(it => it.o.selected);
+        setHl(selIdx >= 0 ? selIdx : (items.length ? 0 : -1));
+    }
+    function close() {
+        wrap.classList.remove('open');
+        sync();
+    }
+    function pick(o) {
+        sel.value = o.value;
+        close();
+        sel.dispatchEvent(new Event('change'));
+    }
+
+    input.addEventListener('focus', () => { input.select(); open(''); });
+    input.addEventListener('input', () => open(input.value));
+    input.addEventListener('blur', close);
+    input.addEventListener('keydown', e => {
+        const isOpen = wrap.classList.contains('open');
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (!isOpen) { open(''); return; }
+            if (!items.length) return;
+            const step = e.key === 'ArrowDown' ? 1 : -1;
+            setHl((hl + step + items.length) % items.length);
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (isOpen && items[hl]) pick(items[hl].o);
+        } else if (e.key === 'Escape') {
+            if (isOpen) { e.preventDefault(); close(); input.select(); }
+        } else if (e.key === 'Tab') {
+            // Accept the highlighted match only if the user actually typed a query
+            if (isOpen && items[hl] && input.value !== sel.selectedOptions[0]?.textContent) pick(items[hl].o);
+        }
+    });
+
+    combos[selectId] = { sync };
+    sync();
+}
+
+function syncCombo(selectId) {
+    if (combos[selectId]) combos[selectId].sync();
+}
+
 // Charts
+let chartColumns = [];
+
+// Derived columns (mostly from v_video_metrics): [friendly label, extra search keywords].
+// Listed in the order they appear under "Derived metrics" in the axis pickers.
+const METRIC_INFO = {
+    bpp_sec:            ['Bytes per pixel per second (PBPS)', 'bpp pbps bits quality density'],
+    ratio_vs_avg:       ['PBPS ratio vs resolution average', 'rva normalized normalised quality bpp'],
+    avg_bpp_for_res:    ['Resolution-class average PBPS', 'bpp baseline mean'],
+    expected_size_mb:   ['Expected size at average PBPS (MB)', 'predicted'],
+    upgrade_score:      ['Upgrade priority score', 'penalty replace'],
+    codec_penalty:      ['Upgrade penalty: codec', 'upgrade score legacy'],
+    res_penalty:        ['Upgrade penalty: resolution', 'upgrade score low res'],
+    ratio_penalty:      ['Upgrade penalty: PBPS ratio', 'upgrade score bad ratio'],
+    mb_per_minute:      ['MB per minute', 'size rate'],
+    size_mb:            ['File size (MB)', 'bytes'],
+    duration_min:       ['Duration (minutes)', 'length runtime'],
+    pixels:             ['Pixel count (width x height)', 'resolution area'],
+    fps:                ['Frame rate (fps)', 'frames'],
+    file_bitrate_mbps:  ['File bitrate (Mbps)', 'bit rate'],
+    video_bitrate_mbps: ['Video stream bitrate (Mbps)', 'bit rate'],
+};
+
+function colTitle(c) {
+    return METRIC_INFO[c] ? METRIC_INFO[c][0] : c;
+}
+
+function chartColumnOptions(columns) {
+    const opt = (c, label, search) =>
+        `<option value="${escHtml(c)}" data-search="${escHtml(search)}">${escHtml(label)}</option>`;
+    const derived = Object.keys(METRIC_INFO).filter(c => columns.includes(c));
+    const raw = columns.filter(c => !(c in METRIC_INFO));
+    let html = '';
+    if (derived.length) {
+        html += '<optgroup label="Derived metrics">' +
+            derived.map(c => opt(c, METRIC_INFO[c][0], c.replace(/_/g, ' ') + ' ' + METRIC_INFO[c][1])).join('') +
+            '</optgroup>';
+    }
+    html += `<optgroup label="${derived.length ? 'Raw fields' : 'Columns'}">` +
+        raw.map(c => opt(c, c, c.replace(/_/g, ' '))).join('') + '</optgroup>';
+    return html;
+}
+
 async function loadChartColumns() {
     const view = document.getElementById('chartViewSelect').value;
     const resp = await fetch(`/api/data?view=${encodeURIComponent(view)}&limit=1`);
     const data = await resp.json();
-    for (const selId of ['chartX', 'chartY']) {
-        document.getElementById(selId).innerHTML = data.columns.map(c => `<option value="${c}">${c}</option>`).join('');
+    chartColumns = data.columns;
+    const options = chartColumnOptions(data.columns);
+    for (const selId of ['chartX', 'chartY', 'chartColor']) {
+        const sel = document.getElementById(selId);
+        const prev = sel.value;
+        sel.innerHTML = (selId === 'chartColor' ? '<option value="">(none)</option>' : '') + options;
+        // Keep the user's pick when switching data source, if the column still exists
+        if (prev && data.columns.includes(prev)) sel.value = prev;
+        syncCombo(selId);
     }
-    document.getElementById('chartColor').innerHTML = '<option value="">(none)</option>' +
-        data.columns.map(c => `<option value="${c}">${c}</option>`).join('');
+}
+
+function fmtHoverVal(v) {
+    if (v === null || v === undefined) return '-';
+    if (typeof v === 'number') return v.toLocaleString(undefined, { maximumFractionDigits: Math.abs(v) < 1 ? 6 : 3 });
+    return escHtml(String(v));
 }
 
 async function renderChart() {
@@ -2142,62 +2186,100 @@ async function renderChart() {
     const yCol = document.getElementById('chartY').value;
     const colorCol = document.getElementById('chartColor').value;
     const agg = document.getElementById('chartAgg').value;
+    // Column that names each point in the hover (raw mode only)
+    const nameCol = ['file_name', 'file_path'].find(c => chartColumns.includes(c));
+    // Codec shown under the name for per-file points (skipped if already plotted)
+    const codecCol = ['video_codec', 'audio_codec', 'subtitle_codec', 'codec_name'].find(c => chartColumns.includes(c));
+    const showCodec = !agg && codecCol && ![xCol, yCol, colorCol].includes(codecCol);
 
     let sql;
-    if (agg && colorCol) {
-        sql = `SELECT [${xCol}], [${colorCol}], ${agg}([${yCol}]) as [${yCol}] FROM [${view}] WHERE [${yCol}] IS NOT NULL GROUP BY [${xCol}], [${colorCol}] ORDER BY [${xCol}]`;
-    } else if (agg) {
-        sql = `SELECT [${xCol}], ${agg}([${yCol}]) as [${yCol}] FROM [${view}] WHERE [${yCol}] IS NOT NULL GROUP BY [${xCol}] ORDER BY [${xCol}]`;
+    if (agg) {
+        const groupCols = colorCol ? `[${xCol}], [${colorCol}]` : `[${xCol}]`;
+        sql = `SELECT ${groupCols}, ${agg}([${yCol}]) as [${yCol}], COUNT(*) AS [__files] FROM [${view}] WHERE [${yCol}] IS NOT NULL GROUP BY ${groupCols} ORDER BY [${xCol}]`;
     } else {
-        sql = `SELECT [${xCol}], [${yCol}]${colorCol ? ', ['+colorCol+']' : ''} FROM [${view}] WHERE [${yCol}] IS NOT NULL LIMIT 5000`;
+        const cols = [...new Set([xCol, yCol, colorCol, nameCol, showCodec && codecCol].filter(Boolean))];
+        sql = `SELECT ${cols.map(c => `[${c}]`).join(', ')} FROM [${view}] WHERE [${yCol}] IS NOT NULL`;
     }
 
-    const resp = await fetch(`/api/query?sql=${encodeURIComponent(sql)}`);
+    const info = document.getElementById('chartInfo');
+    info.textContent = 'Loading...';
+    const resp = await fetch(`/api/query?limit=0&sql=${encodeURIComponent(sql)}`);
     const data = await resp.json();
-    if (data.error) { alert('Query error: ' + data.error); return; }
+    if (data.error) { info.textContent = ''; alert('Query error: ' + data.error); return; }
+    info.textContent = agg ? `${data.rows.length.toLocaleString()} groups`
+                           : `${data.rows.length.toLocaleString()} points`;
 
+    const xTitle = colTitle(xCol);
+    const yTitle = agg ? agg + '(' + colTitle(yCol) + ')' : colTitle(yCol);
     const layout = {
         paper_bgcolor: '#1a1a2e', plot_bgcolor: '#16213e',
         font: { color: '#e0e0e0' },
-        xaxis: { title: xCol + (agg ? '' : ''), gridcolor: '#0f3460' },
-        yaxis: { title: (agg ? agg + '(' + yCol + ')' : yCol), gridcolor: '#0f3460' },
+        xaxis: { title: xTitle, gridcolor: '#0f3460' },
+        yaxis: { title: yTitle, gridcolor: '#0f3460' },
         margin: { t: 40, r: 20 },
+        hovermode: 'closest',
     };
+
+    // Per-point hover: name first (file, or group when aggregated), then X and Y values
+    function hoverText(row) {
+        const lines = [];
+        if (!agg && nameCol) lines.push(`<b>${fmtHoverVal(row[nameCol])}</b>`);
+        if (showCodec) lines.push(`Codec: ${fmtHoverVal(row[codecCol])}`);
+        lines.push(`${escHtml(xTitle)}: ${fmtHoverVal(row[xCol])}`);
+        lines.push(`${escHtml(yTitle)}: ${fmtHoverVal(row[yCol])}`);
+        if (colorCol) lines.push(`${escHtml(colTitle(colorCol))}: ${fmtHoverVal(row[colorCol])}`);
+        if (agg) lines.push(`Files: ${row.__files.toLocaleString()}`);
+        return lines.join('<br>');
+    }
+    // scattergl keeps tens of thousands of points responsive
+    const plotType = chartType === 'scatter' ? 'scattergl' : chartType;
+    const mode = chartType === 'scatter' ? 'markers' : undefined;
+    const marker = chartType === 'scatter' ? { size: 4, opacity: 0.6 } : {};
+
+    function pointTrace(rows, name, color) {
+        const t = { x: rows.map(r => r[xCol]), y: rows.map(r => r[yCol]), text: rows.map(hoverText),
+                    type: plotType, mode, marker: { ...marker } };
+        if (name !== undefined) t.name = name;
+        if (color) t.marker.color = color;
+        if (chartType === 'box') {
+            // Box stats keep Plotly's own hover; outlier points show the file hover text
+            t.boxpoints = 'outliers';
+            t.hoverinfo = 'y+text';
+        } else {
+            t.hovertemplate = '%{text}<extra>' + (name !== undefined ? escHtml(name) : '') + '</extra>';
+        }
+        return t;
+    }
+    function groupRows(key) {
+        const groups = {};
+        for (const row of data.rows) {
+            const g = String(row[key] ?? 'null');
+            (groups[g] = groups[g] || []).push(row);
+        }
+        return Object.entries(groups);
+    }
 
     let traces = [];
 
     if (colorCol && chartType !== 'histogram' && chartType !== 'pie') {
-        const groups = {};
-        for (const row of data.rows) {
-            const g = String(row[colorCol] ?? 'null');
-            if (!groups[g]) groups[g] = { x: [], y: [] };
-            groups[g].x.push(row[xCol]);
-            groups[g].y.push(row[yCol]);
-        }
-        for (const [name, vals] of Object.entries(groups)) {
-            traces.push({ x: vals.x, y: vals.y, name, type: chartType === 'scatter' ? 'scatter' : chartType, mode: chartType === 'scatter' ? 'markers' : undefined });
-        }
+        traces = groupRows(colorCol).map(([name, rows]) => pointTrace(rows, name));
     } else if (chartType === 'histogram') {
-        traces = [{ x: data.rows.map(r => r[yCol]), type: 'histogram', marker: { color: '#e94560' } }];
-        layout.xaxis.title = yCol;
+        traces = [{ x: data.rows.map(r => r[yCol]), type: 'histogram', marker: { color: '#e94560' },
+                    hovertemplate: `${escHtml(yTitle)}: %{x}<br>Files: %{y:,}<extra></extra>` }];
+        layout.xaxis.title = yTitle;
         layout.yaxis.title = 'frequency';
     } else if (chartType === 'pie') {
-        traces = [{ labels: data.rows.map(r => r[xCol]), values: data.rows.map(r => r[yCol]), type: 'pie', textfont: { color: '#fff' } }];
+        traces = [{ labels: data.rows.map(r => r[xCol]), values: data.rows.map(r => r[yCol]), type: 'pie',
+                    textfont: { color: '#fff' },
+                    hovertemplate: `<b>%{label}</b><br>${escHtml(yTitle)}: %{value:,}<br>%{percent}<extra></extra>` }];
     } else if (chartType === 'box') {
-        const groups = {};
-        for (const row of data.rows) {
-            const g = String(row[xCol] ?? 'null');
-            if (!groups[g]) groups[g] = [];
-            groups[g].push(row[yCol]);
-        }
-        for (const [name, vals] of Object.entries(groups)) {
-            traces.push({ y: vals, name, type: 'box' });
-        }
+        traces = groupRows(xCol).map(([name, rows]) => {
+            const t = pointTrace(rows, name);
+            delete t.x;
+            return t;
+        });
     } else {
-        traces = [{ x: data.rows.map(r => r[xCol]), y: data.rows.map(r => r[yCol]),
-                     type: chartType === 'scatter' ? 'scatter' : 'bar',
-                     mode: chartType === 'scatter' ? 'markers' : undefined,
-                     marker: { color: '#e94560' } }];
+        traces = [pointTrace(data.rows, undefined, '#e94560')];
     }
 
     Plotly.newPlot('chart', traces, layout, { responsive: true });
@@ -2297,30 +2379,17 @@ async function loadPBPSTiles(force) {
 }
 
 async function loadPBPS() {
-    const baseSql = `WITH bpp AS (
-    SELECT *,
-           file_size_bytes * 1.0 / (width * height * duration_seconds) AS bpp_sec
-    FROM v_video_summary
-    WHERE width > 0 AND height > 0 AND duration_seconds > 60
-),
-avg_bpp AS (
-    SELECT resolution_class,
-           AVG(bpp_sec) AS avg_bpp_sec
-    FROM bpp
-    GROUP BY resolution_class
-)
-SELECT b.file_name,
-       b.file_path,
-       b.video_codec,
-       b.resolution_class,
-       ROUND(b.bpp_sec, 6) AS bpp_sec,
-       ROUND(a.avg_bpp_sec, 6) AS avg_for_res,
-       ROUND(b.bpp_sec / a.avg_bpp_sec, 4) AS ratio_vs_avg,
-       ROUND(b.file_size_bytes / 1048576.0, 1) AS size_mb,
-       ROUND(b.duration_seconds / 60.0, 1) AS dur_min
-FROM bpp b
-JOIN avg_bpp a ON b.resolution_class = a.resolution_class
-WHERE dur_min > 10`;
+    const baseSql = `SELECT file_name,
+       file_path,
+       video_codec,
+       resolution_class,
+       ROUND(bpp_sec, 6) AS bpp_sec,
+       ROUND(avg_bpp_for_res, 6) AS avg_for_res,
+       ROUND(ratio_vs_avg, 4) AS ratio_vs_avg,
+       ROUND(file_size_bytes / 1048576.0, 1) AS size_mb,
+       ROUND(duration_seconds / 60.0, 1) AS dur_min
+FROM v_video_metrics
+WHERE ratio_vs_avg IS NOT NULL AND dur_min > 10`;
 
     // Fetch worst (DESC) and best (ASC) in parallel
     const [descResp, ascResp] = await Promise.all([

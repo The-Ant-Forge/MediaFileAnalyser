@@ -187,7 +187,72 @@ SELECT
     json_extract(s.disposition_json, '$.hearing_impaired') AS is_sdh
 FROM files f
 JOIN streams s ON s.file_id = f.id AND s.codec_type = 'subtitle';
+
+-- Video summary plus derived quality metrics. Single source of truth for bpp_sec
+-- (file bytes per pixel per second), the per-resolution-class baseline (files > 60s)
+-- and upgrade scoring; the web app's quality queries all read from here.
+-- Upgrade penalties are only set for files > 10 min with a valid bpp_sec.
+CREATE VIEW IF NOT EXISTS v_video_metrics AS
+WITH base AS (
+    SELECT v.*,
+           v.width * v.height AS pixels,
+           ROUND(v.file_size_bytes / 1048576.0, 2) AS size_mb,
+           ROUND(v.duration_seconds / 60.0, 2) AS duration_min,
+           ROUND(v.file_bit_rate / 1000000.0, 3) AS file_bitrate_mbps,
+           ROUND(v.video_bit_rate / 1000000.0, 3) AS video_bitrate_mbps,
+           CASE WHEN instr(v.r_frame_rate, '/') > 0
+                 AND CAST(substr(v.r_frame_rate, instr(v.r_frame_rate, '/') + 1) AS REAL) > 0
+                THEN ROUND(CAST(substr(v.r_frame_rate, 1, instr(v.r_frame_rate, '/') - 1) AS REAL)
+                         / CAST(substr(v.r_frame_rate, instr(v.r_frame_rate, '/') + 1) AS REAL), 3)
+           END AS fps,
+           CASE WHEN v.width > 0 AND v.height > 0 AND v.duration_seconds > 0
+                THEN v.file_size_bytes * 1.0 / (v.width * v.height * v.duration_seconds)
+           END AS bpp_sec
+    FROM v_video_summary v
+),
+baselined AS (
+    SELECT *,
+           AVG(CASE WHEN duration_seconds > 60 THEN bpp_sec END)
+               OVER (PARTITION BY resolution_class) AS avg_bpp_for_res
+    FROM base
+),
+rated AS (
+    SELECT *,
+           CASE WHEN duration_seconds > 60 THEN bpp_sec / avg_bpp_for_res END AS ratio_vs_avg,
+           CASE WHEN duration_seconds > 60
+                THEN avg_bpp_for_res * pixels * duration_seconds / 1048576.0 END AS expected_size_mb
+    FROM baselined
+),
+scored AS (
+    SELECT *,
+           CASE WHEN duration_seconds / 60.0 > 10 AND bpp_sec IS NOT NULL THEN
+               CASE WHEN video_codec IN ('mpeg2video', 'msmpeg4v3') THEN 5
+                    WHEN video_codec = 'vc1' THEN 4
+                    WHEN video_codec = 'h264' THEN 3
+                    ELSE 0 END
+           END AS codec_penalty,
+           CASE WHEN duration_seconds / 60.0 > 10 AND bpp_sec IS NOT NULL THEN
+               CASE WHEN resolution_class = 'other' THEN 5
+                    WHEN resolution_class = '480p' THEN 4
+                    WHEN resolution_class = '720p' THEN 2
+                    ELSE 0 END
+           END AS res_penalty,
+           CASE WHEN duration_seconds / 60.0 > 10 AND bpp_sec IS NOT NULL THEN
+               CASE WHEN ratio_vs_avg > 2.0 THEN 3
+                    WHEN ratio_vs_avg > 1.5 THEN 2
+                    WHEN ratio_vs_avg < 0.3 THEN 3
+                    WHEN ratio_vs_avg < 0.5 THEN 1
+                    ELSE 0 END
+           END AS ratio_penalty
+    FROM rated
+)
+SELECT *, codec_penalty + res_penalty + ratio_penalty AS upgrade_score
+FROM scored;
 """
+
+# Views defined in DB_SCHEMA; dropped before re-running it so definitions stay current.
+# Dependent views first.
+VIEW_NAMES = ["v_video_metrics", "v_video_summary", "v_audio_summary", "v_subtitle_summary"]
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -195,7 +260,7 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     # Drop views first so schema script recreates them with latest thresholds
-    for view in ["v_video_summary", "v_audio_summary", "v_subtitle_summary"]:
+    for view in VIEW_NAMES:
         conn.execute(f"DROP VIEW IF EXISTS [{view}]")
     conn.executescript(DB_SCHEMA)
     _migrate_db(conn)
