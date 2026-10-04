@@ -296,12 +296,13 @@ def find_video_files(paths: list[str]) -> list[str]:
     return files
 
 
-def probe_file(filepath: str, timeout: int = 120, ffprobe_cmd: str = "ffprobe") -> dict | None:
-    """Run ffprobe on a file and return parsed JSON."""
+def probe_file_with_error(filepath: str, timeout: int = 120,
+                          ffprobe_cmd: str = "ffprobe") -> tuple[dict | None, str | None]:
+    """Run ffprobe on a file. Returns (parsed JSON, None) or (None, error message)."""
     try:
         result = subprocess.run(
             [
-                ffprobe_cmd, "-v", "quiet",
+                ffprobe_cmd, "-v", "error",
                 "-print_format", "json",
                 "-show_format", "-show_streams",
                 filepath,
@@ -309,11 +310,24 @@ def probe_file(filepath: str, timeout: int = 120, ffprobe_cmd: str = "ffprobe") 
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         if result.returncode != 0:
-            return None
-        return json.loads(result.stdout)
+            lines = [ln.strip() for ln in result.stderr.splitlines() if ln.strip()]
+            if not lines:
+                return None, f"ffprobe exited with code {result.returncode}"
+            # ffprobe prefixes messages with "<path>: "; the caller already knows the path
+            return None, lines[-1].removeprefix(filepath + ": ")
+        return json.loads(result.stdout), None
     except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
         print(f"  ERROR probing: {e}", file=sys.stderr)
-        return None
+        if isinstance(e, subprocess.TimeoutExpired):
+            return None, f"ffprobe timed out after {timeout}s"
+        if isinstance(e, json.JSONDecodeError):
+            return None, f"ffprobe output was not valid JSON: {e}"
+        return None, str(e)
+
+
+def probe_file(filepath: str, timeout: int = 120, ffprobe_cmd: str = "ffprobe") -> dict | None:
+    """Run ffprobe on a file and return parsed JSON."""
+    return probe_file_with_error(filepath, timeout=timeout, ffprobe_cmd=ffprobe_cmd)[0]
 
 
 def safe_int(val) -> int | None:

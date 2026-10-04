@@ -12,6 +12,7 @@ import math
 import os
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -113,6 +114,7 @@ scan_state = {
     "done": 0,
     "errors": 0,
     "message": "",
+    "report_issues": 0,
 }
 scan_lock = threading.Lock()
 
@@ -121,23 +123,31 @@ scan_lock = threading.Lock()
 # Scan logic (reuses index_media internals)
 # ---------------------------------------------------------------------------
 from index_media import (
-    VIDEO_EXTENSIONS, init_db, probe_file,
+    VIDEO_EXTENSIONS, init_db, probe_file_with_error,
     insert_file, insert_streams,
 )
 
 
 def find_video_files_filtered(paths, ignore_patterns):
-    """Walk directories finding video files, skipping ignored folder names."""
+    """Walk directories finding video files, skipping ignored folder names.
+    Returns (files, unreachable) where unreachable is a list of (path, reason)
+    for scan folders that don't exist and directories that couldn't be listed."""
     files = []
+    unreachable = []
     lower_patterns = [p.lower() for p in ignore_patterns if p]
+
+    def on_walk_error(err):
+        unreachable.append((err.filename or "", f"could not list folder: {err.strerror or err}"))
+
     for base in paths:
         if not os.path.exists(base):
+            unreachable.append((base, "scan folder not found (offline or unmounted?)"))
             continue
         if os.path.isfile(base):
             if Path(base).suffix.lower() in VIDEO_EXTENSIONS:
                 files.append(base)
             continue
-        for root, dirs, filenames in os.walk(base):
+        for root, dirs, filenames in os.walk(base, onerror=on_walk_error):
             # Prune ignored directories in-place
             if lower_patterns:
                 dirs[:] = [d for d in dirs
@@ -145,7 +155,22 @@ def find_video_files_filtered(paths, ignore_patterns):
             for fname in sorted(filenames):
                 if Path(fname).suffix.lower() in VIDEO_EXTENSIONS:
                     files.append(os.path.join(root, fname))
-    return files
+    return files, unreachable
+
+
+def _norm_path(p):
+    return os.path.normcase(os.path.normpath(p))
+
+
+def _is_under(path_norm, folder_norm):
+    """True if normalised path is the folder itself or inside it."""
+    return path_norm == folder_norm or path_norm.startswith(folder_norm.rstrip(os.sep) + os.sep)
+
+
+def scan_report_path():
+    """Last-scan report lives next to the library DB, one per library."""
+    db = os.path.abspath(DB_PATH)
+    return os.path.join(os.path.dirname(db), Path(db).stem + "_scan_report.json")
 
 
 def _load_existing_index():
@@ -216,16 +241,48 @@ def run_scan():
         with scan_lock:
             scan_state["phase"] = "discovering"
             scan_state["message"] = "Scanning directories..."
-        video_files = find_video_files_filtered(folders, ignore)
+        video_files, unreachable = find_video_files_filtered(folders, ignore)
 
         if not video_files:
+            detail = "; ".join(p for p, _ in unreachable)
             with scan_lock:
                 scan_state.update(running=False, phase="error",
-                                  message="No video files found in configured folders")
+                                  message="No video files found in configured folders"
+                                          + (f" (unreachable: {detail})" if detail else "")
+                                          + ". Database left unchanged.")
             return
 
-        # Phase: checking which files need probing
         existing_index, has_timestamps = _load_existing_index()
+        found_set = set(video_files)
+
+        # Protection 1: a scan folder that exists but yields no files while the DB still
+        # holds files under it is treated as unreachable (e.g. an empty mount point).
+        found_norm = [_norm_path(f) for f in video_files]
+        existing_norm = {fp: _norm_path(fp) for fp in existing_index}
+        for base in folders:
+            if not os.path.isdir(base) or any(p == base for p, _ in unreachable):
+                continue
+            b = _norm_path(base)
+            if not any(_is_under(f, b) for f in found_norm):
+                had = sum(1 for n in existing_norm.values() if _is_under(n, b))
+                if had:
+                    unreachable.append((base, f"scan folder is empty but the library had {had} files there"))
+
+        # Files under unreachable folders are carried over from the old DB instead of dropped
+        carried = []
+        unreachable_report = []
+        for path, reason in unreachable:
+            if not path:
+                continue
+            un = _norm_path(path)
+            kept = [fp for fp, n in existing_norm.items() if fp not in found_set and _is_under(n, un)]
+            carried.extend(kept)
+            unreachable_report.append({"path": path, "reason": reason, "kept_files": len(kept)})
+        carried = list(dict.fromkeys(carried))  # nested unreachable dirs can overlap
+        carried_set = set(carried)
+        removed = sorted(fp for fp in existing_index if fp not in found_set and fp not in carried_set)
+
+        # Phase: checking which files need probing
         to_probe = []
         to_copy = []
 
@@ -248,12 +305,16 @@ def run_scan():
                     to_probe.append(fp)
         else:
             # No timestamps in DB — skip stat checks, probe everything
-            to_probe = video_files
+            to_probe = list(video_files)
+        unchanged_count = len(to_copy)
+        to_copy.extend(carried)
 
         with scan_lock:
-            scan_state["total"] = len(video_files)
+            scan_state["total"] = len(to_copy) + len(to_probe)
             scan_state["phase"] = "probing"
-            msg = f"{len(to_copy)} unchanged, {len(to_probe)} to probe" if to_copy else f"{len(to_probe)} files to probe"
+            msg = f"{unchanged_count} unchanged, {len(to_probe)} to probe" if to_copy else f"{len(to_probe)} files to probe"
+            if carried:
+                msg += f", {len(carried)} kept from unreachable folders"
             if not has_timestamps and existing_index:
                 msg += " (no cached timestamps — full re-probe)"
             scan_state["message"] = msg
@@ -268,10 +329,13 @@ def run_scan():
         done = 0
         errors = 0
         skipped = len(to_copy)
+        probed_ok = 0
+        probe_failures = []
+        # Old DB stays open through probing so failed probes can fall back to the previous rows
+        src_conn = get_db() if existing_index and os.path.exists(DB_PATH) else None
 
-        # Copy unchanged files from existing DB
-        if to_copy and os.path.exists(DB_PATH):
-            src_conn = get_db()
+        # Copy unchanged (and carried-over) files from existing DB
+        if to_copy and src_conn:
             batch_count = 0
             for fp in to_copy:
                 if not _copy_file_rows(src_conn, conn, fp):
@@ -285,7 +349,6 @@ def run_scan():
                     scan_state["done"] = done
                     scan_state["message"] = f"Copied {done}/{len(to_copy)} unchanged, {len(to_probe)} to probe"
             conn.commit()
-            src_conn.close()
 
         # Probe new/changed files in parallel
         if to_probe:
@@ -293,16 +356,26 @@ def run_scan():
                 scan_state["message"] = f"Probing {len(to_probe)} new/changed files..."
 
             def probe_and_insert(filepath):
-                return filepath, probe_file(filepath, ffprobe_cmd=ffprobe_cmd)
+                return (filepath, *probe_file_with_error(filepath, ffprobe_cmd=ffprobe_cmd))
 
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(probe_and_insert, f): f for f in to_probe}
                 batch_count = 0
                 for future in as_completed(futures):
-                    filepath, probe_data = future.result()
+                    filepath, probe_data, probe_error = future.result()
                     if probe_data is None:
                         errors += 1
+                        # Protection 2: keep the previous data for files we already knew about
+                        kept = bool(src_conn and filepath in existing_index
+                                    and _copy_file_rows(src_conn, conn, filepath))
+                        probe_failures.append({
+                            "file_name": os.path.basename(filepath),
+                            "file_path": filepath,
+                            "error": probe_error or "unknown error",
+                            "kept_previous": kept,
+                        })
                     else:
+                        probed_ok += 1
                         try:
                             mtime = os.stat(filepath).st_mtime
                         except OSError:
@@ -310,10 +383,10 @@ def run_scan():
                         file_id = insert_file(conn, filepath, probe_data, file_mtime=mtime)
                         if file_id:
                             insert_streams(conn, file_id, probe_data)
-                        batch_count += 1
-                        if batch_count >= 100:
-                            conn.commit()
-                            batch_count = 0
+                    batch_count += 1
+                    if batch_count >= 100:
+                        conn.commit()
+                        batch_count = 0
 
                     done += 1
                     with scan_lock:
@@ -322,13 +395,16 @@ def run_scan():
                         scan_state["message"] = f"{done}/{len(video_files)} files ({skipped} cached, {errors} errors)"
 
                 conn.commit()
+        if src_conn:
+            src_conn.close()
 
         # Phase: swapping databases
         with scan_lock:
             scan_state["phase"] = "swapping"
             scan_state["message"] = "Finalizing database..."
 
-        # Preserve scan_snapshots from the live DB into the temp DB
+        # Preserve scan_snapshots from the live DB into the temp DB. If this fails we must
+        # not swap, or the snapshot history would be lost.
         if os.path.exists(DB_PATH):
             try:
                 live_conn = get_db()
@@ -354,8 +430,16 @@ def run_scan():
                             [d[c] for c in cols])
                     conn.commit()
                 live_conn.close()
-            except Exception:
-                pass
+            except Exception as e:
+                conn.close()
+                for f in [temp_db, temp_db + "-wal", temp_db + "-shm"]:
+                    if os.path.exists(f):
+                        os.remove(f)
+                with scan_lock:
+                    scan_state.update(running=False, phase="error",
+                                      message=f"Could not carry snapshot history into the new database ({e}). "
+                                              "Database left unchanged.")
+                return
 
         # Checkpoint and close temp DB
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -395,9 +479,36 @@ def run_scan():
 
         invalidate_all_caches()
         capture_snapshot()
+
+        report = {
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "library": lib["name"],
+            "found": len(video_files),
+            "unchanged": unchanged_count,
+            "probed": probed_ok,
+            "carried_over": len(carried),
+            "unreachable": unreachable_report,
+            "probe_failures": sorted(probe_failures, key=lambda r: r["file_path"]),
+            "removed": removed,
+        }
+        try:
+            with open(scan_report_path(), "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=1)
+        except OSError:
+            pass  # report is informational; the scan itself succeeded
+
+        issues = []
+        if probe_failures:
+            issues.append(f"{len(probe_failures)} unreadable")
+        if carried:
+            issues.append(f"{len(carried)} kept from unreachable folders")
+        if removed:
+            issues.append(f"{len(removed)} removed")
         with scan_lock:
             scan_state.update(running=False, phase="done",
-                              message=f"Scan complete: {done} files ({skipped} cached, {len(to_probe)} probed, {errors} errors)")
+                              message=f"Scan complete: {done} files ({unchanged_count} cached, {probed_ok} probed"
+                                      + (", " + ", ".join(issues) if issues else "") + ")",
+                              report_issues=len(probe_failures) + len(unreachable_report))
 
     except Exception as e:
         with scan_lock:
@@ -996,6 +1107,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self.handle_get_libraries()
         elif path == "/api/scan/status":
             self.handle_scan_status()
+        elif path == "/api/scan/report":
+            self.handle_scan_report()
         elif path == "/api/pbps/tiles":
             self.handle_pbps_tiles()
         elif path == "/api/distributions":
@@ -1091,6 +1204,14 @@ class APIHandler(BaseHTTPRequestHandler):
         with scan_lock:
             self.send_json(dict(scan_state))
 
+    def handle_scan_report(self):
+        """Last scan report for the active library ({} if none yet)."""
+        try:
+            with open(scan_report_path(), encoding="utf-8") as f:
+                self.send_json(json.load(f))
+        except (OSError, ValueError):
+            self.send_json({})
+
     def handle_pbps_tiles(self):
         try:
             self.send_json(get_pbps_tiles())
@@ -1162,6 +1283,7 @@ class APIHandler(BaseHTTPRequestHandler):
             scan_state["done"] = 0
             scan_state["errors"] = 0
             scan_state["message"] = ""
+            scan_state["report_issues"] = 0
         t = threading.Thread(target=run_scan, daemon=True)
         t.start()
         self.send_json({"started": True})
@@ -1502,6 +1624,10 @@ td.clickable-path:hover { color: var(--green); }
 .scan-toast .progress-bar { height: 100%; background: var(--green); border-radius: 4px;
                             transition: width 0.3s ease; min-width: 0; }
 .scan-toast .progress-bar.error { background: var(--accent); }
+.scan-toast a { color: #e0a030; cursor: pointer; text-decoration: underline; }
+.report-warn { border-left: 3px solid #e0a030; background: rgba(224,160,48,0.08); padding: 6px 10px;
+               margin: 6px 0; font-size: 0.85em; }
+.report-warn code { color: var(--text); }
 .scan-toast .scan-info { white-space: nowrap; color: var(--text2); }
 .scan-toast .dismiss-btn { background: none; border: none; color: var(--text2); cursor: pointer;
                            font-size: 1.1em; padding: 2px 6px; }
@@ -1686,6 +1812,14 @@ td.clickable-path:hover { color: var(--green); }
     <div id="progressResChart" style="min-height:300px"></div>
     <h2>Quality Metrics</h2>
     <div id="progressQualityChart" style="min-height:300px"></div>
+    <h2 id="scanReportHeading">Last Scan Report</h2>
+    <div id="scanReportSummary" class="info"></div>
+    <div id="scanReportUnreachable"></div>
+    <div class="table-wrap" id="scanFailWrap" style="max-height:300px"></div>
+    <details id="scanRemovedDetails" style="display:none;margin-top:8px">
+        <summary class="info" style="cursor:pointer" id="scanRemovedSummary"></summary>
+        <div class="table-wrap" id="scanRemovedWrap" style="max-height:300px"></div>
+    </details>
     <h2>Manage Snapshots</h2>
     <div class="table-wrap" id="snapshotTableWrap" style="max-height:300px"></div>
 </div>
@@ -1930,6 +2064,8 @@ function handleTableClick(e) {
 }
 document.getElementById('pbpsTableWrap').addEventListener('click', handleTableClick);
 document.getElementById('upgradeTableWrap').addEventListener('click', handleTableClick);
+document.getElementById('scanFailWrap').addEventListener('click', handleTableClick);
+document.getElementById('scanRemovedWrap').addEventListener('click', handleTableClick);
 
 function sortBy(col) {
     if (currentSort === col) currentDir = currentDir === 'asc' ? 'desc' : 'asc';
@@ -2641,7 +2777,59 @@ async function loadUpgrades(force) {
 }
 
 // Progress tracking
+// Snapshot sizes are stored in GiB; show TB (binary, as Windows Explorer does) once past 1024
+function fmtSize(gb) {
+    if (gb === null || gb === undefined) return '-';
+    return gb >= 1024 ? (gb / 1024).toFixed(2) + ' TB' : Number(gb).toFixed(2) + ' GB';
+}
+
+async function loadScanReport() {
+    const resp = await fetch('/api/scan/report');
+    const r = await resp.json();
+    const summary = document.getElementById('scanReportSummary');
+    const unreach = document.getElementById('scanReportUnreachable');
+    const removedDetails = document.getElementById('scanRemovedDetails');
+    if (!r.finished_at) {
+        summary.textContent = 'No scan report yet. One is saved after each scan from this app.';
+        unreach.innerHTML = '';
+        document.getElementById('scanFailWrap').innerHTML = '';
+        removedDetails.style.display = 'none';
+        return;
+    }
+    const n = v => Number(v || 0).toLocaleString();
+    summary.textContent = `Finished ${r.finished_at} · ${n(r.found)} files found · ${n(r.unchanged)} unchanged · ` +
+        `${n(r.probed)} probed · ${n(r.probe_failures.length)} unreadable · ${n(r.carried_over)} kept from unreachable folders · ` +
+        `${n(r.removed.length)} removed`;
+
+    unreach.innerHTML = r.unreachable.map(u =>
+        `<div class="report-warn"><code>${escHtml(u.path)}</code>: ${escHtml(u.reason)}. ` +
+        `${n(u.kept_files)} previously indexed file(s) kept unchanged.</div>`).join('');
+
+    const failWrap = document.getElementById('scanFailWrap');
+    if (r.probe_failures.length) {
+        renderSortableTable('scanFailWrap', ['file_name', 'file_path', 'error', 'previous_data'],
+            r.probe_failures.map(f => ({ ...f, previous_data: f.kept_previous ? 'kept' : 'none (not indexed)' })));
+    } else {
+        failWrap.innerHTML = '<p class="info">All files were readable.</p>';
+    }
+
+    removedDetails.style.display = r.removed.length ? '' : 'none';
+    if (r.removed.length) {
+        document.getElementById('scanRemovedSummary').textContent =
+            `${n(r.removed.length)} file(s) removed from the library (no longer on disk)`;
+        renderSortableTable('scanRemovedWrap', ['file_name', 'file_path'],
+            r.removed.map(p => ({ file_name: p.split(/[\\/]/).pop(), file_path: p })));
+    }
+}
+
+function showScanReport() {
+    document.querySelector('.tab[data-section="progress-section"]').click();
+    loadProgress();
+    document.getElementById('scanReportHeading').scrollIntoView({ behavior: 'smooth' });
+}
+
 async function loadProgress() {
+    loadScanReport();
     const resp = await fetch('/api/snapshots');
     const snaps = await resp.json();
     if (!snaps.length) {
@@ -2694,9 +2882,10 @@ async function loadProgress() {
     }, { responsive: true });
 
     // Snapshot management table
-    let thtml = '<table><thead><tr><th>#</th><th>Date</th><th>Files</th><th>Size (GB)</th><th>h264</th><th>hevc</th><th>av1</th><th>1080p</th><th>720p</th><th>RVA&gt;1.5</th><th>RVA&lt;0.5</th><th></th></tr></thead><tbody>';
+    let thtml = '<table><thead><tr><th>#</th><th>Date</th><th>Files</th><th>Size</th><th>h264</th><th>hevc</th><th>av1</th><th>1080p</th><th>720p</th><th>RVA&gt;1.5</th><th>RVA&lt;0.5</th><th></th></tr></thead><tbody>';
     thtml += snaps.map(s =>
-        `<tr><td>${s.id}</td><td>${s.scanned_at}</td><td>${s.total_files}</td><td>${s.total_size_gb}</td>` +
+        `<tr><td>${s.id}</td><td>${s.scanned_at}</td><td>${s.total_files}</td>` +
+        `<td title="${s.total_size_gb ?? ''} GB" style="text-align:right">${fmtSize(s.total_size_gb)}</td>` +
         `<td>${s.h264_count}</td><td>${s.hevc_count}</td><td>${s.av1_count}</td>` +
         `<td>${s.res_1080p}</td><td>${s.res_720p}</td>` +
         `<td>${s.rva_up_count}</td><td>${s.rva_down_count}</td>` +
@@ -2950,6 +3139,10 @@ async function pollScanStatus() {
             document.getElementById('scanBtn').classList.remove('scanning');
             if (s.phase === 'done') {
                 bar.style.width = '100%';
+                detail.textContent = s.message;
+                if (s.report_issues) {
+                    detail.insertAdjacentHTML('beforeend', ' · <a onclick="showScanReport()">View scan report</a>');
+                }
                 loadData();  // refresh current view
                 loadPBPSTiles(true);  // refresh tiles (force, cache invalidated server-side)
                 distLoaded = false;  // invalidate client caches

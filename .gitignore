@@ -12,6 +12,7 @@ venv/
 
 # Logs
 *.log
+*_scan_report.json
 
 # Output
 stats.txt
